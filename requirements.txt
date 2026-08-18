@@ -1,0 +1,39 @@
+# Safety-State-Aware Waveform PGD dependencies
+# Install with: pip install -r requirements.txt
+# Supported runtime: Python 3.10
+
+# Core: PyTorch waveform optimization
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
+
+# Core: primary Qwen model adapter
+transformers==4.57.1
+accelerate==1.10.1
+
+# Core: numerical, audio, and data pipeline
+numpy==1.26.4
+scipy==1.12.0
+librosa==0.10.2.post1
+soundfile==0.12.1
+gTTS==2.5.4
+pandas==2.2.3
+datasets==3.2.0
+
+# Core evaluation schema and optional remote StrongREJECT judge backend
+pydantic==2.10.6
+openai==1.109.1
+python-dotenv==1.0.1
+
+# Optional behavioral evaluator (installed here for the full evaluation suite)
+jailbreakeval==0.0.4
+
+# Optional archived Voxtral adapter.
+mistral-common[audio]==1.8.5
+
+# Optional reporting conveniences retained for experiment notebooks/scripts
+tabulate==0.9.0
+tqdm==4.67.1
+
+# PESQ/STOI are intentionally not pinned here. Install `pesq` and `pystoi`
+# only when those optional perceptual metrics are explicitly required.
