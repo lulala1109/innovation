@@ -1,0 +1,506 @@
+"""
+Basic Projected Gradient Descent (PGD) attack on audio waveforms.
+"""
+
+# math 这里只用于判断 SNR 是否为有限数值（math.isfinite）。
+import math
+
+# torch 提供张量运算、自动求导、随机数生成器以及 no_grad/梯度开关等功能。
+import torch
+# Literal 用于限制字符串参数只能取预先声明的几个值，便于类型检查。
+from typing import Any, Callable, Collection, Dict, Literal, Mapping, Optional
+
+# BaseWavAttacker 是波形攻击器基类；AttackResult 用于统一封装攻击结果。
+from attacks.base import BaseWavAttacker, AttackResult
+from core.behavior_decision import BehaviorEvaluator, evaluate_behavior
+# BaseAudioModel 是音频模型抽象接口；本类依赖它提供 loss、margin loss 和文本生成能力。
+from models.base import BaseAudioModel
+
+
+# PGDAttacker 继承 BaseWavAttacker，因此 eps、alpha、梯度处理、扰动裁剪、SNR 计算等公共能力来自父类。
+class PGDAttacker(BaseWavAttacker):
+    """
+    Standard PGD attack for audio models.
+
+    Iteratively perturbs the audio waveform using gradient ascent on the
+    loss function, projecting back to the epsilon-ball after each step.
+
+    Supports both cross-entropy and margin loss.
+    """
+
+    # 构造函数：配置被攻击模型、L∞ 扰动预算、PGD 步长、损失类型及可选低通梯度处理。
+    def __init__(
+        self,
+        model: BaseAudioModel,
+        eps: float = 0.1,
+        alpha: float = 0.005,
+        loss_type: Literal["ce", "margin"] = "margin",
+        kappa: float = 5.0,
+        use_lowpass: bool = False,
+        lowpass_cutoff: float = 2000.0,
+        verbose: bool = True
+    ):
+        """
+        Initialize PGD attacker.
+
+        Args:
+            model: Audio model to attack
+            eps: Maximum L-infinity perturbation
+            alpha: Step size
+            loss_type: "ce" for cross-entropy, "margin" for margin loss
+            kappa: Margin parameter (only for margin loss)
+            use_lowpass: Whether to lowpass filter gradients
+            lowpass_cutoff: Cutoff frequency for lowpass (Hz)
+            verbose: Print progress
+        """
+        # 先调用父类构造函数保存通用攻击参数，并完成父类需要的初始化。
+        super().__init__(
+            model=model,
+            eps=eps,
+            alpha=alpha,
+            use_lowpass=use_lowpass,
+            lowpass_cutoff=lowpass_cutoff,
+            verbose=verbose
+        )
+        # 本类额外保存损失函数类型；后续 compute_loss 会根据它分派到不同损失函数。
+        self.loss_type = loss_type
+        # kappa 是 margin loss 的间隔/置信度相关参数，仅在 margin 模式下使用。
+        self.kappa = kappa
+
+    # 统一损失入口：attack 主循环不需要关心当前使用 CE 还是 margin loss。
+    def compute_loss(
+        self,
+        wav: torch.Tensor,
+        target_text: str
+    ) -> torch.Tensor:
+        """Compute loss based on loss_type."""
+        # margin 模式调用模型的 compute_margin_loss；否则退回普通 compute_loss。
+        if self.loss_type == "margin":
+            return self.model.compute_margin_loss(wav, target_text, kappa=self.kappa)
+        else:
+            return self.model.compute_loss(wav, target_text)
+
+    # attack 是核心 PGD 过程：初始化扰动 -> 反复计算梯度并更新 -> 投影 -> 定期生成文本检查 -> 选最佳候选。
+    def attack(
+        self,
+        wav: torch.Tensor,
+        target_text: str,
+        steps: int = 100,
+        init_mode: Literal["zero", "random"] = "zero",
+        seed: int = 42,
+        check_every: int = 20,
+        early_stop: bool = True,
+        state_callback: Optional[Callable] = None,
+        checkpoint_steps: Optional[Collection[int]] = None,
+        behavior_evaluator: Optional[BehaviorEvaluator] = None,
+        resume_state: Optional[Mapping[str, Any]] = None,
+    ) -> AttackResult:
+        """
+        Perform PGD attack.
+
+        State means the number of completed PGD updates. State 0 is the
+        initialized perturbation and state N is the perturbation after N
+        updates, so N updates produce N+1 aligned loss measurements.
+        """
+        # 把输入音频移动到模型所在设备，避免 CPU/GPU 设备不一致。
+        wav = wav.to(self.model.device)
+
+        # 输入合法性检查 1：NaN/Inf 会污染 loss 和梯度，因此直接拒绝。
+        if not torch.isfinite(wav).all():
+            raise ValueError("Input waveform contains NaN or infinite values")
+        # 输入合法性检查 2：代码假定波形已经归一化到 [-1, 1]。
+        if wav.amin().item() < -1.0 or wav.amax().item() > 1.0:
+            raise ValueError("Input waveform must be within [-1, 1]")
+        # 仅支持零扰动初始化和随机扰动初始化两种模式。
+        if init_mode not in {"zero", "random"}:
+            raise ValueError(
+                f"Unsupported initialization mode: {init_mode}"
+            )
+        # steps=0 是允许的，此时只评估初始化状态，不进行 PGD 更新。
+        if steps < 0:
+            raise ValueError("steps must be non-negative")
+        # check_every=0 也是允许的，表示关闭中间周期性生成检查，但 state=0 和最终 state 仍会检查。
+        if check_every < 0:
+            raise ValueError("check_every must be non-negative")
+
+        checkpoint_set = None
+        if checkpoint_steps is not None:
+            checkpoint_set = {int(step) for step in checkpoint_steps}
+            invalid_steps = sorted(
+                step for step in checkpoint_set
+                if step < 0 or step > steps
+            )
+            if invalid_steps:
+                raise ValueError(
+                    "checkpoint_steps must be within [0, steps]; "
+                    f"invalid values: {invalid_steps}"
+                )
+
+        # 先得到未攻击音频的确定性模型输出，便于后续比较，也用于零初始化 state=0 的复用。
+        self.log("Getting original model output...")
+        original_output = self.model.generate(
+            wav,
+            do_sample=False
+        )
+        self.log(f"Original: {original_output}")
+        self.log(f"Target: {target_text}")
+
+        start_state = 0
+        if resume_state is not None:
+            if not isinstance(resume_state, Mapping):
+                raise TypeError("resume_state must be a mapping")
+            start_state = int(resume_state.get("step", -1))
+            if start_state < 0 or start_state > steps:
+                raise ValueError("resume step must be within [0, steps]")
+            if "delta" not in resume_state:
+                raise ValueError("resume_state must contain delta")
+            delta = self.validate_resume_delta(
+                resume_state["delta"], wav, name="delta"
+            ).requires_grad_(True)
+        else:
+            # A device-local generator isolates random initialization from
+            # unrelated global RNG consumption.
+            generator = None
+            if init_mode == "random":
+                generator = torch.Generator(device=wav.device)
+                generator.manual_seed(seed)
+            delta = self.init_perturbation(
+                wav=wav,
+                random_init=(init_mode == "random"),
+                generator=generator,
+            )
+
+        restored = resume_state or {}
+        first_success_step = restored.get("first_success_step")
+        if first_success_step is not None:
+            first_success_step = int(first_success_step)
+            if first_success_step < 0 or first_success_step > start_state:
+                raise ValueError("resume first_success_step is inconsistent")
+
+        history = {
+            "iterations": [],
+            "generation_checks": [],
+            "selection": None,
+            "first_success_step": first_success_step,
+            "resumed_from_step": start_state if resume_state is not None else None,
+        }
+
+        def restore_candidate(name: str) -> Optional[torch.Tensor]:
+            value = restored.get(name)
+            if value is None:
+                return None
+            return self.validate_resume_delta(value, wav, name=name)
+
+        best_delta = restore_candidate("best_delta")
+        best_loss = (
+            float(restored.get("best_loss"))
+            if best_delta is not None
+            else float("inf")
+        )
+        best_state = (
+            int(restored.get("best_state"))
+            if best_delta is not None
+            else None
+        )
+        best_success_delta = restore_candidate("best_success_delta")
+        best_success_loss = (
+            float(restored.get("best_success_loss"))
+            if best_success_delta is not None
+            else float("inf")
+        )
+        best_success_state = (
+            int(restored.get("best_success_state"))
+            if best_success_delta is not None
+            else None
+        )
+        for label, loss_value, state_value in (
+            ("best", best_loss, best_state),
+            ("best_success", best_success_loss, best_success_state),
+        ):
+            if state_value is not None and (
+                not math.isfinite(loss_value)
+                or state_value < 0
+                or state_value > start_state
+            ):
+                raise ValueError(f"resume {label} candidate is inconsistent")
+
+        updates_done = start_state
+
+        self.log(f"\nStarting PGD attack ({self.loss_type} loss)")
+        self.log(f"eps={self.eps}, alpha={self.alpha}, steps={steps}")
+        if init_mode == "random":
+            self.log(f"initialization=random, seed={seed}")
+        else:
+            self.log("initialization=zero")
+        self.log("-" * 50)
+
+        # 遍历 steps+1 个状态：state=0 是初始化后的扰动，state=N 表示已经做完 N 次更新。
+        for state in range(steps + 1):
+            # 对抗样本由原始音频和当前扰动直接相加得到：x_adv = x + delta。
+            adv_wav = wav + delta
+            # 最后一个 state 只需要评估，不需要再计算梯度或执行下一步更新。
+            needs_update = state < steps
+
+            # The final state only needs evaluation, not a backward graph.
+            # 仅在还需要更新时建立 autograd 图；最终状态关闭梯度可减少显存和计算开销。
+            with torch.set_grad_enabled(needs_update):
+                loss = self.compute_loss(
+                    adv_wav,
+                    target_text
+                )
+
+            # 把 loss 脱离计算图并转成 Python float，专门用于日志、比较和历史记录。
+            loss_val = float(loss.detach().item())
+            # clone 当前 delta，冻结“这个 state 的扰动快照”，避免后续更新 delta 后历史候选被覆盖。
+            current_delta = delta.detach().clone()
+
+            # 这里明确采用“loss 越小越好”的选择准则，因此该实现的优化方向是最小化目标 loss。
+            is_best = loss_val < best_loss
+            if is_best:
+                best_loss = loss_val
+                best_delta = current_delta
+                best_state = state
+
+            # L∞ 范数 = 扰动各采样点绝对值的最大值，用于观察是否接近 eps 预算边界。
+            delta_linf = float(
+                current_delta.abs().max().item()
+            )
+            # RMS 衡量扰动整体能量大小，相比 L∞ 更能反映平均扰动强度。
+            delta_rms = float(
+                current_delta.square().mean().sqrt().item()
+            )
+            # 计算原音频与当前对抗音频的信噪比 SNR；通常 SNR 越高表示扰动相对越弱。
+            snr = self.compute_snr(wav, adv_wav)
+            # 如果 SNR 为 inf/-inf/NaN，则历史中保存 None，避免写入非有限浮点数。
+            snr_value = float(snr) if math.isfinite(snr) else None
+
+            # 把当前 state 的 loss、最佳 loss、扰动幅度和 SNR 全部保存下来，便于画收敛曲线或复现实验。
+            iteration_record: Dict[str, object] = {
+                "step": state,
+                "updates_completed": state,
+                "loss": loss_val,
+                "best_loss": best_loss,
+                "is_best": is_best,
+                "delta_linf": delta_linf,
+                "delta_rms": delta_rms,
+                "snr_db": snr_value,
+            }
+            history["iterations"].append(iteration_record)
+
+            should_snapshot = (
+                state_callback is not None
+                and (checkpoint_set is None or state in checkpoint_set)
+            )
+            if should_snapshot:
+                state_callback(
+                    state,
+                    (wav + current_delta).detach(),
+                    current_delta,
+                    dict(iteration_record),
+                )
+
+            # 日志不必每步都打印：state=0 打初始 loss，之后每 10 步或最后一步打印一次。
+            if state == 0:
+                self.log(f"Initial Loss: {loss_val:.4f}")
+            elif state % 10 == 0 or state == steps:
+                self.log(
+                    f"Step {state}/{steps} | Loss: {loss_val:.4f}"
+                )
+
+            # 决定当前 state 是否真正调用 generate 检查文本攻击是否成功。
+            should_check = (
+                state == 0
+                or state == steps
+                or (
+                    check_every > 0
+                    and state > 0
+                    and state % check_every == 0
+                )
+            )
+
+            # State 0 output was already generated before the loop. Checking it
+            # here avoids a second model generation and supports steps=0.
+            # state=0 单独处理：零初始化时可直接复用 original_output；随机初始化则必须重新生成一次。
+            if state == 0 and should_check:
+                if init_mode == "zero":
+                    output = original_output
+                else:
+                    with torch.no_grad():
+                        output = self.model.generate(
+                            wav + current_delta,
+                            do_sample=False
+                        )
+                decision_now = evaluate_behavior(
+                    target_text, output, behavior_evaluator
+                )
+                success_now = decision_now.attack_success
+                # 每次真实执行文本生成检查，都把输出和成功标志写入 generation_checks。
+                history["generation_checks"].append({
+                    "step": state,
+                    "output": output,
+                    "success": success_now,
+                    "behavior": decision_now.as_dict(),
+                })
+
+                # 若初始状态已经成功，则立即登记为当前最佳成功候选；early_stop=True 时可直接结束。
+                if success_now:
+                    if history["first_success_step"] is None:
+                        history["first_success_step"] = state
+                    best_success_loss = loss_val
+                    best_success_delta = current_delta
+                    best_success_state = state
+
+                    if early_stop:
+                        updates_done = state
+                        break
+
+            # processed_grad 先置空；只有 needs_update=True 才会通过反向传播得到它。
+            processed_grad = None
+            if needs_update:
+                # 反向传播计算 d(loss)/d(delta)。要求 delta 在父类初始化时已经参与可求导计算。
+                loss.backward()
+
+                # 若 delta.grad 为空，说明扰动没有进入可求导路径或 requires_grad 配置异常，因此显式报错。
+                if delta.grad is None:
+                    raise RuntimeError(
+                        "PGD perturbation gradient is missing"
+                    )
+
+                # process_gradient 是父类钩子：可能原样返回梯度，也可能按配置进行低通滤波等处理。
+                processed_grad = self.process_gradient(
+                    delta.grad.detach()
+                )
+
+            # Backward has released the loss graph. Generation still uses
+            # exactly the current state because delta has not been updated yet.
+            # 非零 state 的文本检查放在 backward 之后、delta 更新之前，因此检查的仍然是“当前 state”的对抗样本。
+            if state != 0 and should_check:
+                # 文本生成不需要梯度；no_grad 可以降低显存占用，也避免无意义的计算图构建。
+                with torch.no_grad():
+                    output = self.model.generate(
+                        wav + current_delta,
+                        do_sample=False
+                    )
+
+                decision_now = evaluate_behavior(
+                    target_text, output, behavior_evaluator
+                )
+                success_now = decision_now.attack_success
+                history["generation_checks"].append({
+                    "step": state,
+                    "output": output,
+                    "success": success_now,
+                    "behavior": decision_now.as_dict(),
+                })
+
+                self.log(f"  → Output: {output[:80]}...")
+
+                # 若多个状态都成功，则保留成功候选中 loss 更低的那个，而不是简单保留第一次成功。
+                if success_now and history["first_success_step"] is None:
+                    history["first_success_step"] = state
+                if success_now and loss_val < best_success_loss:
+                    best_success_loss = loss_val
+                    best_success_delta = current_delta
+                    best_success_state = state
+
+                # early_stop=True 时，一旦当前检查点成功就停止；否则继续搜索可能具有更低 loss 的成功状态。
+                if success_now and early_stop:
+                    self.log(
+                        f"\n✓ Target achieved at step {state}!"
+                    )
+                    updates_done = state
+                    delta.grad = None
+                    break
+
+            # 最终 state 没有下一次更新，因此在完成评估/检查后退出循环。
+            if not needs_update:
+                updates_done = state
+                break
+
+            # 更新扰动时关闭梯度跟踪，因为这是优化变量的手工原地更新，不需要构建新的 autograd 图。
+            with torch.no_grad():
+                # 核心更新：delta = delta - alpha * sign(grad)。这是 L∞ PGD 常见的 sign-gradient 步骤，方向是降低当前 loss。
+                delta -= self.alpha * processed_grad.sign()
+
+            # 投影/裁剪步骤：把更新后的扰动重新限制到合法集合内；精确约束由父类 clamp_perturbation 决定。
+            delta = self.clamp_perturbation(delta, wav)
+            # 清空旧梯度，防止 PyTorch 默认的梯度累积影响下一次迭代。
+            delta.grad = None
+            # 完成一次更新后，下一轮 state 会比当前 state 多 1 次已完成更新。
+            updates_done = state + 1
+
+        # 候选选择优先级：只要出现过成功状态，就从成功状态中选 loss 最低者。
+        if best_success_delta is not None:
+            selected_delta = best_success_delta
+            selected_state = best_success_state
+            selection_reason = "successful_candidate"
+            selected_recorded_loss = best_success_loss
+        # 如果从未达到成功判据，则退化为选择整个优化过程中 loss 最低的状态。
+        else:
+            selected_delta = best_delta
+            selected_state = best_state
+            selection_reason = "lowest_loss"
+            selected_recorded_loss = best_loss
+
+        # 理论上至少会评估 state=0；此保护用于捕获异常情况，避免后续对 None 做张量运算。
+        if selected_delta is None or selected_state is None:
+            raise RuntimeError("PGD did not produce a selectable candidate")
+
+        # 使用最终选中的扰动重新构造最终对抗音频，而不是默认使用循环结束时的最后一个 delta。
+        final_wav = wav + selected_delta
+        # 最终 loss 和文本输出再次独立计算，用于确认被选状态的最终结果并形成返回值。
+        with torch.no_grad():
+            final_loss = float(
+                self.compute_loss(
+                    final_wav,
+                    target_text
+                ).item()
+            )
+            final_output = self.model.generate(
+                final_wav,
+                do_sample=False
+            )
+
+        # 最终 success 重新基于 final_output 判断，保证返回字段与真正输出保持一致。
+        final_decision = evaluate_behavior(
+            target_text, final_output, behavior_evaluator
+        )
+        success = final_decision.attack_success
+        # 重新计算最终样本的 SNR，供最终日志展示。
+        snr = self.compute_snr(wav, final_wav)
+
+        # selection 记录被选中的 state、选择理由、迭代中记录的 loss、重算后的 final loss 和最终成功状态。
+        history["selection"] = {
+            "step": selected_state,
+            "reason": selection_reason,
+            "recorded_loss": selected_recorded_loss,
+            "final_loss": final_loss,
+            "success": success,
+            "behavior": final_decision.as_dict(),
+        }
+
+        # 以下仅负责打印最终攻击摘要，不影响候选选择与返回结果。
+        self.log("\n" + "=" * 50)
+        self.log("Attack Complete")
+        self.log(
+            f"Selected State: {selected_state} ({selection_reason})"
+        )
+        self.log(f"Final Loss: {final_loss:.4f}")
+        self.log(f"SNR: {snr:.2f} dB")
+        self.log(f"Success: {success}")
+        self.log(f"Final Output: {final_output}")
+        self.log("=" * 50)
+
+        # 统一返回 AttackResult；音频和扰动 detach 后搬到 CPU，便于后续保存、评估或序列化。
+        return AttackResult(
+            original_wav=wav.detach().cpu(),
+            adversarial_wav=final_wav.detach().cpu(),
+            perturbation=selected_delta.detach().cpu(),
+            original_output=original_output,
+            adversarial_output=final_output,
+            target_text=target_text,
+            success=success,
+            final_loss=final_loss,
+            steps_taken=updates_done,
+            history=history
+        )

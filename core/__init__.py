@@ -1,0 +1,59 @@
+"""Shared primitives for safety-state experiments.
+
+Imports stay lazy so data and evaluation CLIs do not initialize audio or model
+dependencies merely by importing :mod:`core`.
+"""
+
+from importlib import import_module
+
+
+_EXPORT_MODULES = {
+    "load_audio": "core.audio",
+    "generate_tts": "core.audio",
+    "normalize_audio": "core.audio",
+    "lowpass_filter_gradient": "core.audio",
+    "save_audio": "core.audio",
+    "resolve_layer_indices": "core.activations",
+    "pool_tokens": "core.activations",
+    "pool_hidden_state": "core.activations",
+    "collect_hidden_states": "core.activations",
+    "HiddenStateCollector": "core.activations",
+    "ForwardActivationCollector": "core.activations",
+    "ActivationPatch": "core.activations",
+    "ActivationPatcher": "core.activations",
+    "patch_activations": "core.activations",
+    "LinearSafetyProbe": "core.safety_state",
+    "LayerwiseLinearSafetyProbe": "core.safety_state",
+    "DualSafetyStateScorer": "core.safety_state",
+    "DualSafetyScores": "core.safety_state",
+    "compute_safety_gaps": "core.safety_state",
+    "compute_layer_weights": "core.safety_state",
+    "dynamic_bottleneck": "core.safety_state",
+    "differentiable_state_loss": "core.safety_state",
+    "TrajectoryArtifactStore": "core.artifacts",
+    "CheckpointRecord": "core.artifacts",
+    "RecoveredCheckpoint": "core.artifacts",
+    "ArtifactError": "core.artifacts",
+    "LLMJudge": "core.judge",
+    "JudgeScore": "core.judge",
+    "JudgeLogEntry": "core.judge",
+    "configure_reproducibility": "core.reproducibility",
+    "collect_run_metadata": "core.reproducibility",
+    "BehaviorDecision": "core.behavior_decision",
+    "BehaviorEvaluator": "core.behavior_decision",
+    "coerce_behavior_decision": "core.behavior_decision",
+    "evaluate_behavior": "core.behavior_decision",
+    "target_substring_decision": "core.behavior_decision",
+}
+
+
+def __getattr__(name):
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+__all__ = list(_EXPORT_MODULES)
