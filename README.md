@@ -7,17 +7,12 @@
 
 本目录不包含模型权重、数据集、实验结果、`.env` 或 API 密钥。
 
-研究文档已归档为 [创新点迁移--8.12.docx](docs/创新点迁移--8.12.docx) 和
-[白盒音频越狱_具体实验方案.docx](docs/白盒音频越狱_具体实验方案.docx)。
-
 ## 当前研究边界
 
 - **Qwen 2.5 Omni 是安全状态主方法。** `QwenModel.forward_attack()` 提供可微
   WAV→官方对齐 MEL→音频 embedding→语言模型 hidden states 的完整路径。
 - `models/optional/phi.py` 和 `models/optional/voxtral.py` 是迁移后的可选归档，
   不在默认 model factory 中，也没有经过当前主线验证。
-- direct-MEL、RL-PGD 和 Two-Stage 攻击不属于当前公平威胁模型，旧主线已在功能
-  迁移后移除；不要把 MEL-space epsilon 与本项目的 waveform epsilon 混合比较。
 - 本代码面向经授权的模型安全研究与防御评测。运行者负责数据、模型和评测服务
   的访问权限。
 

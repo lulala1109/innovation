@@ -35,6 +35,8 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "stratum",
     "benign_text",
     "harmful_text",
+    "benign_response",
+    "benign_refused",
     "clean_response",
     "clean_refused",
     "jailbreak_response",
@@ -53,6 +55,7 @@ IDENTITY_COLUMNS: tuple[str, ...] = (
 )
 
 COMPLETION_COLUMNS: tuple[str, ...] = (
+    "benign_response",
     "clean_response",
     "jailbreak_response",
     "clean_audio_path",
@@ -65,7 +68,11 @@ STATE_AUDIO_COLUMNS: tuple[str, ...] = (
     "jailbreak_audio_path",
 )
 
-BOOLEAN_COLUMNS: tuple[str, ...] = ("clean_refused", "jailbreak_success")
+BOOLEAN_COLUMNS: tuple[str, ...] = (
+    "benign_refused",
+    "clean_refused",
+    "jailbreak_success",
+)
 
 COLUMN_ALIASES: Mapping[str, tuple[str, ...]] = {
     "pair_id": ("pair_id", "id"),
@@ -83,6 +90,16 @@ COLUMN_ALIASES: Mapping[str, tuple[str, ...]] = {
         "harmful_goal",
         "prompt",
         "goal",
+    ),
+    "benign_response": (
+        "benign_response",
+        "benign_clean_response",
+        "x_b_response",
+    ),
+    "benign_refused": (
+        "benign_refused",
+        "benign_is_refused",
+        "x_b_refused",
     ),
     "clean_response": (
         "clean_response",
@@ -284,7 +301,13 @@ def validate_manifest(
     require_complete: bool = False,
     require_state_triplets: bool = False,
 ) -> None:
-    """Validate schema, unique pairing, and X_H/X_J state consistency."""
+    """Validate schema, unique pairing, and X_B/X_H/X_J consistency.
+
+    A valid safety-state triplet has the following independently observed
+    labels: ``X_B = H0/R0``, ``X_H = H1/R1``, and ``X_J = H1/R0``.  In
+    particular, a benign response is never assumed to be non-refusing merely
+    because its prompt is benign.
+    """
 
     missing_columns = [name for name in MANIFEST_COLUMNS if name not in manifest.columns]
     if missing_columns:
@@ -354,19 +377,26 @@ def validate_manifest(
                 rows = manifest.index[values.isna()].tolist()[:5]
                 raise ManifestValidationError(f"{name} is unknown at row(s): {rows}")
 
+    benign_refused = parsed_booleans["benign_refused"]
     clean_refused = parsed_booleans["clean_refused"]
     jailbreak_success = parsed_booleans["jailbreak_success"]
-    orphan_jailbreak = jailbreak_success.fillna(False) & ~clean_refused.fillna(False)
+    valid_benign = benign_refused.eq(False).fillna(False)
+    valid_clean_harmful = clean_refused.eq(True).fillna(False)
+    valid_jailbreak = jailbreak_success.eq(True).fillna(False)
+    orphan_jailbreak = valid_jailbreak & ~(
+        valid_benign & valid_clean_harmful
+    )
     if orphan_jailbreak.any():
         rows = manifest.index[orphan_jailbreak].tolist()[:5]
         raise ManifestValidationError(
-            "X_J must be paired with a refused X_H state; violation at row(s): "
+            "X_J must be paired with a non-refusing X_B and a refused X_H "
+            "state; violation at row(s): "
             f"{rows}"
         )
 
     if require_state_triplets:
         not_triplet = ~(
-            clean_refused.fillna(False) & jailbreak_success.fillna(False)
+            valid_benign & valid_clean_harmful & valid_jailbreak
         )
         if not_triplet.any():
             rows = manifest.index[not_triplet].tolist()[:5]
@@ -374,7 +404,7 @@ def validate_manifest(
                 "Every row must form an X_B/X_H/X_J triplet; incomplete row(s): "
                 f"{rows}"
             )
-        for name in STATE_AUDIO_COLUMNS:
+        for name in (*STATE_AUDIO_COLUMNS, *COMPLETION_COLUMNS):
             blank = manifest[name].map(_normalize_identity_text) == ""
             if blank.any():
                 rows = manifest.index[blank].tolist()[:5]
@@ -419,25 +449,33 @@ def select_state_sets(manifest: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
 
     validate_manifest(manifest)
+    benign_refused = _boolean_series(
+        manifest, "benign_refused", canonical_name="benign_refused"
+    )
     clean_refused = _boolean_series(
         manifest, "clean_refused", canonical_name="clean_refused"
-    ).fillna(False)
+    )
     jailbreak_success = _boolean_series(
         manifest, "jailbreak_success", canonical_name="jailbreak_success"
-    ).fillna(False)
+    )
+    valid_benign = benign_refused.eq(False).fillna(False)
+    valid_clean_harmful = valid_benign & clean_refused.eq(True).fillna(False)
+    valid_jailbreak = (
+        valid_clean_harmful & jailbreak_success.eq(True).fillna(False)
+    )
     return {
         "X_B": _state_view(
-            manifest,
+            manifest.loc[valid_benign],
             state="X_B",
             text_column="benign_text",
             audio_column="benign_audio_path",
-            response_column=None,
+            response_column="benign_response",
             state_jailbreak_success=False,
             harmfulness_label=0,
             refusal_label=0,
         ),
         "X_H": _state_view(
-            manifest.loc[clean_refused],
+            manifest.loc[valid_clean_harmful],
             state="X_H",
             text_column="harmful_text",
             audio_column="clean_audio_path",
@@ -447,7 +485,7 @@ def select_state_sets(manifest: pd.DataFrame) -> dict[str, pd.DataFrame]:
             refusal_label=1,
         ),
         "X_J": _state_view(
-            manifest.loc[clean_refused & jailbreak_success],
+            manifest.loc[valid_jailbreak],
             state="X_J",
             text_column="harmful_text",
             audio_column="jailbreak_audio_path",

@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from collections import OrderedDict
 from pathlib import Path
 
 import pandas as pd
 import torch
+
+import experiments.collect_safety_states as collector_module
 
 from data.build_safety_pairs import (
     ManifestValidationError,
@@ -27,6 +31,7 @@ from experiments.build_pair_references import (
 )
 from experiments.collect_safety_states import (
     StateCollectionError,
+    build_model_provenance,
     collect_safety_states,
     validate_collection_payload,
 )
@@ -34,6 +39,7 @@ from experiments.train_safety_probes import validate_training_payload
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENT_FINGERPRINT = hashlib.sha256(b"collector-test-experiment").hexdigest()
 
 
 class _Forward:
@@ -104,6 +110,8 @@ class StateCollectionTests(unittest.TestCase):
                     "stratum": "cyber",
                     "benign_text": f"benign {index}",
                     "harmful_text": f"harmful {index}",
+                    "benign_response": "benign answer",
+                    "benign_refused": False,
                     "clean_response": "I refuse",
                     "clean_refused": True,
                     "jailbreak_response": "harmful answer",
@@ -135,6 +143,7 @@ class StateCollectionTests(unittest.TestCase):
                         "metadata": {
                             "step": 3,
                             "pair_id": trajectory_owner,
+                            "experiment_fingerprint": EXPERIMENT_FINGERPRINT,
                         }
                     }
                 )
@@ -151,6 +160,45 @@ class StateCollectionTests(unittest.TestCase):
         offset = sum(ord(character) for character in stem) % 7
         return torch.full((1, 8), float(offset) / 10.0)
 
+    def _behavior_labels(
+        self,
+        root: Path,
+        *,
+        status="ok",
+        generation_status="ok",
+        tamper=False,
+    ) -> Path:
+        index_path = root / "case-a" / "trajectory_index.jsonl"
+        index_row = json.loads(index_path.read_text(encoding="utf-8"))
+        index_row["metadata"]["case_id"] = "case-alpha"
+        index_path.write_text(json.dumps(index_row) + "\n", encoding="utf-8")
+        checkpoint_path = root / "case-a" / "checkpoint_000003.pt"
+        response = "offline judged response"
+        digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        normalized_status = status.strip().casefold()
+        label = {
+            "format": "stage1-behavior-label",
+            "version": 1,
+            "case_id": "case-alpha",
+            "pair_id": "pair-a",
+            "step": 3,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": hashlib.sha256(
+                checkpoint_path.read_bytes()
+            ).hexdigest(),
+            "experiment_fingerprint": EXPERIMENT_FINGERPRINT,
+            "response": response,
+            "response_sha256": "0" * 64 if tamper else digest,
+            "generation_status": generation_status,
+            "label_status": status,
+            "refusal_label": False if normalized_status == "ok" else None,
+            "compliance_label": True if normalized_status == "ok" else None,
+            "jailbreak_success": True if normalized_status == "ok" else None,
+        }
+        path = root / "behavior_labels.jsonl"
+        path.write_text(json.dumps(label) + "\n", encoding="utf-8")
+        return path
+
     def test_manifest_benign_audio_alias_and_state_views(self):
         frame = pd.DataFrame(
             {
@@ -158,6 +206,8 @@ class StateCollectionTests(unittest.TestCase):
                 "stratum": ["cyber"],
                 "benign_text": ["benign"],
                 "harmful_text": ["harmful"],
+                "benign_response": ["benign answer"],
+                "benign_refused": [False],
                 "clean_response": ["refuse"],
                 "clean_refused": [True],
                 "jailbreak_response": ["answer"],
@@ -221,6 +271,72 @@ class StateCollectionTests(unittest.TestCase):
             loaded = torch.load(output, map_location="cpu", weights_only=True)
             self.assertEqual(loaded["pair_ids"], payload["pair_ids"])
 
+    def test_stage1_split_and_role_provenance_reach_probe_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            frame = pd.read_csv(manifest)
+            frame["measurement_split"] = "measurement_train"
+            frame["stage1_role"] = "probe_candidate"
+            frame.to_csv(manifest, index=False)
+            payload = collect_safety_states(
+                manifest,
+                model=_ToyModel(),
+                audio_loader=self._audio_loader,
+                judge=_Judge(),
+                include_trajectories=False,
+            )
+        self.assertEqual(payload["metadata"]["measurement_splits"], ["measurement_train"])
+        self.assertEqual(payload["metadata"]["stage1_roles"], ["probe_candidate"])
+        self.assertTrue(
+            all(
+                row["measurement_split"] == "measurement_train"
+                and row["stage1_role"] == "probe_candidate"
+                for row in payload["row_metadata"]
+            )
+        )
+        validate_training_payload(payload)
+
+    def test_model_provenance_is_canonical_and_schema_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_directory = root / "model"
+            model_directory.mkdir()
+            provenance = build_model_provenance(
+                "qwen-3b", str(model_directory), "bfloat16"
+            )
+            payload = collect_safety_states(
+                self._fixture(root),
+                model=_ToyModel(),
+                audio_loader=self._audio_loader,
+                judge=_Judge(),
+                include_trajectories=False,
+                model_provenance=provenance,
+            )
+
+        metadata = payload["metadata"]
+        self.assertEqual(metadata["model_provenance"], provenance)
+        self.assertEqual(metadata["model_id"], str(model_directory.resolve()))
+        self.assertEqual(metadata["model_fingerprint"], provenance["model_fingerprint"])
+        validate_collection_payload(payload)
+        payload["metadata"]["model_fingerprint"] = "0" * 64
+        with self.assertRaisesRegex(StateCollectionError, "must agree"):
+            validate_collection_payload(payload)
+
+    def test_model_provenance_rejects_a_tampered_fingerprint(self):
+        provenance = dict(build_model_provenance("qwen-3b", None, "bfloat16"))
+        provenance["model_fingerprint"] = "0" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(StateCollectionError, "fingerprint mismatch"):
+                collect_safety_states(
+                    self._fixture(root),
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    include_trajectories=False,
+                    model_provenance=provenance,
+                )
+
     def test_rejects_cross_pair_trajectory_ownership(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -232,6 +348,233 @@ class StateCollectionTests(unittest.TestCase):
                     audio_loader=self._audio_loader,
                     judge=_Judge(),
                 )
+
+    def test_explicit_behavior_sidecar_joins_by_identity_and_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(root)
+            payload = collect_safety_states(
+                manifest,
+                model=_ToyModel(),
+                audio_loader=self._audio_loader,
+                behavior_labels=labels,
+            )
+            trajectory = payload["states"].index("trajectory")
+            self.assertEqual(
+                payload["responses"][trajectory], "offline judged response"
+            )
+            self.assertEqual(int(payload["refusal_labels"][trajectory]), 0)
+            self.assertEqual(
+                payload["row_metadata"][trajectory]["response_sha256"],
+                hashlib.sha256(b"offline judged response").hexdigest(),
+            )
+            self.assertEqual(
+                payload["row_metadata"][trajectory]["experiment_fingerprint"],
+                EXPERIMENT_FINGERPRINT,
+            )
+            self.assertEqual(
+                payload["row_metadata"][trajectory]["checkpoint_sha256"],
+                hashlib.sha256(
+                    (root / "case-a" / "checkpoint_000003.pt").read_bytes()
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                payload["metadata"]["trajectory_label_counts"],
+                {"ok": 1, "unknown_skipped": 0},
+            )
+
+    def test_unknown_behavior_label_is_skipped_and_counted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(
+                root,
+                status="  UnKnOwN  ",
+                generation_status="  ErRoR  ",
+            )
+            payload = collect_safety_states(
+                manifest,
+                model=_ToyModel(),
+                audio_loader=self._audio_loader,
+                behavior_labels=labels,
+            )
+            self.assertNotIn("trajectory", payload["states"])
+            self.assertEqual(
+                payload["metadata"]["trajectory_label_counts"],
+                {"ok": 0, "unknown_skipped": 1},
+            )
+
+    def test_behavior_sidecar_requires_supported_format_and_version(self):
+        invalid_values = (
+            ("format", "other-behavior-label", "format"),
+            ("version", 2, "version"),
+            ("version", True, "version"),
+        )
+        for field, value, message in invalid_values:
+            with self.subTest(field=field, value=value):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest = self._fixture(root)
+                    labels = self._behavior_labels(root)
+                    label = json.loads(labels.read_text(encoding="utf-8"))
+                    label[field] = value
+                    labels.write_text(json.dumps(label) + "\n", encoding="utf-8")
+
+                    with self.assertRaisesRegex(StateCollectionError, message):
+                        collect_safety_states(
+                            manifest,
+                            model=_ToyModel(),
+                            audio_loader=self._audio_loader,
+                            behavior_labels=labels,
+                        )
+
+    def test_behavior_sidecar_rejects_invalid_status_combinations(self):
+        invalid_statuses = (
+            ("pending", "unknown", "generation_status"),
+            ("error", "ok", "requires generation_status='ok'"),
+        )
+        for generation_status, label_status, message in invalid_statuses:
+            with self.subTest(
+                generation_status=generation_status,
+                label_status=label_status,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest = self._fixture(root)
+                    labels = self._behavior_labels(
+                        root,
+                        generation_status=generation_status,
+                        status=label_status,
+                    )
+                    with self.assertRaisesRegex(StateCollectionError, message):
+                        collect_safety_states(
+                            manifest,
+                            model=_ToyModel(),
+                            audio_loader=self._audio_loader,
+                            behavior_labels=labels,
+                        )
+
+    def test_behavior_label_requires_fingerprint_and_checkpoint_digest(self):
+        for missing_field in ("experiment_fingerprint", "checkpoint_sha256"):
+            with self.subTest(missing_field=missing_field):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest = self._fixture(root)
+                    labels = self._behavior_labels(root)
+                    label = json.loads(labels.read_text(encoding="utf-8"))
+                    del label[missing_field]
+                    labels.write_text(json.dumps(label) + "\n", encoding="utf-8")
+
+                    with self.assertRaisesRegex(
+                        StateCollectionError, missing_field
+                    ):
+                        collect_safety_states(
+                            manifest,
+                            model=_ToyModel(),
+                            audio_loader=self._audio_loader,
+                            behavior_labels=labels,
+                        )
+
+    def test_behavior_provenance_rejects_stale_fingerprint_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(root)
+            label = json.loads(labels.read_text(encoding="utf-8"))
+            label["experiment_fingerprint"] = hashlib.sha256(
+                b"different-experiment"
+            ).hexdigest()
+            labels.write_text(json.dumps(label) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                StateCollectionError, "experiment_fingerprint does not match"
+            ):
+                collect_safety_states(
+                    manifest,
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    behavior_labels=labels,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(root)
+            checkpoint = root / "case-a" / "checkpoint_000003.pt"
+            with checkpoint.open("ab") as handle:
+                handle.write(b"stale-checkpoint")
+
+            with self.assertRaisesRegex(
+                StateCollectionError, "checkpoint_sha256 does not match"
+            ):
+                collect_safety_states(
+                    manifest,
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    behavior_labels=labels,
+                )
+
+    def test_manifest_case_id_must_match_trajectory_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(root)
+            frame = pd.read_csv(manifest)
+            frame.loc[frame["pair_id"] == "pair-a", "case_id"] = "wrong-case"
+            frame.to_csv(manifest, index=False)
+
+            with self.assertRaisesRegex(
+                StateCollectionError, "trajectory case_id.*manifest case_id"
+            ):
+                collect_safety_states(
+                    manifest,
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    behavior_labels=labels,
+                )
+
+    def test_behavior_hash_mismatch_and_ambiguous_judge_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._fixture(root)
+            labels = self._behavior_labels(root, tamper=True)
+            with self.assertRaisesRegex(StateCollectionError, "response_sha256"):
+                collect_safety_states(
+                    manifest,
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    behavior_labels=labels,
+                )
+
+            class SuccessOnlyJudge:
+                def evaluate(self, prompt, response):
+                    return {"attack_success": False}
+
+            with self.assertRaisesRegex(StateCollectionError, "cannot infer refusal"):
+                collect_safety_states(
+                    manifest,
+                    model=_ToyModel(),
+                    audio_loader=self._audio_loader,
+                    judge=SuccessOnlyJudge(),
+                    include_trajectories=False,
+                )
+
+    def test_project_root_relative_path_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "dataset" / "audio.wav"
+            target.parent.mkdir(parents=True)
+            target.touch()
+            manifest_base = root / "dataset" / "processed" / "stage1"
+            manifest_base.mkdir(parents=True)
+            with mock.patch.object(collector_module, "PROJECT_ROOT", root):
+                resolved = collector_module._resolve_local_path(
+                    manifest_base,
+                    "dataset/audio.wav",
+                    name="test audio",
+                )
+            self.assertEqual(resolved, target.resolve())
 
     def test_collection_schema_rejects_row_pair_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:

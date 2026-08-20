@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
 import json
 import os
@@ -23,8 +24,11 @@ from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, S
 
 COLLECTION_FORMAT = "safety-state-probe-training"
 COLLECTION_VERSION = 1
+BEHAVIOR_LABEL_FORMAT = "stage1-behavior-label"
+BEHAVIOR_LABEL_VERSION = 1
 BASE_STATES = ("X_B", "X_H", "X_J")
 TRAJECTORY_STATE = "trajectory"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _TRAJECTORY_COLUMNS = (
     "trajectory_path",
     "trajectory_index_path",
@@ -48,6 +52,7 @@ _RESPONSE_KEYS = (
 )
 _REFUSAL_KEYS = ("refusal_label", "refused", "is_refused", "refusal")
 _SUCCESS_KEYS = ("jailbreak_success", "attack_success", "is_success", "jailbroken")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class StateCollectionError(ValueError):
@@ -99,6 +104,88 @@ def _json_safe(value: Any, *, name: str) -> Any:
         raise StateCollectionError(
             f"{name} must contain only finite JSON-compatible metadata"
         ) from exc
+
+
+def _required_sha256(value: Any, *, name: str) -> str:
+    """Return one canonical lowercase SHA-256 digest or reject it."""
+
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise StateCollectionError(
+            f"{name} must be a 64-character lowercase SHA-256 digest"
+        )
+    return value
+
+
+def build_model_provenance(
+    model_name: str,
+    model_id: Optional[str],
+    dtype: str,
+) -> Mapping[str, str]:
+    """Return the canonical, lightweight model identity used by Stage 1.
+
+    Hashing multi-gigabyte model shards for every command would be needlessly
+    expensive. Stage 1 instead binds artifacts to the resolved model
+    arguments. The replay entry point uses the same canonical JSON digest.
+    """
+
+    from models import DEFAULT_MODEL_IDS
+
+    normalized_name = str(model_name).strip()
+    normalized_dtype = str(dtype).strip()
+    if not normalized_name:
+        raise StateCollectionError("model_name must be non-blank")
+    if not normalized_dtype:
+        raise StateCollectionError("dtype must be non-blank")
+    resolved_model_id = (
+        DEFAULT_MODEL_IDS.get(normalized_name, normalized_name)
+        if model_id is None
+        else str(model_id).strip()
+    )
+    if not resolved_model_id:
+        raise StateCollectionError("model_id must be non-blank")
+    path = Path(resolved_model_id).expanduser()
+    if path.exists():
+        resolved_model_id = str(path.resolve())
+    canonical = {
+        "model_name": normalized_name,
+        "model_id": resolved_model_id,
+        "dtype": normalized_dtype,
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        **canonical,
+        "model_fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _normalize_model_provenance(value: Mapping[str, Any]) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise StateCollectionError("model_provenance must be a mapping")
+    normalized = build_model_provenance(
+        str(value.get("model_name", "")),
+        None if value.get("model_id") is None else str(value.get("model_id")),
+        str(value.get("dtype", "")),
+    )
+    supplied = value.get("model_fingerprint")
+    if supplied is not None and _required_sha256(
+        supplied, name="model_provenance.model_fingerprint"
+    ) != normalized["model_fingerprint"]:
+        raise StateCollectionError("model_provenance fingerprint mismatch")
+    return normalized
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -166,9 +253,131 @@ def _resolve_local_path(base: Path, value: Any, *, name: str) -> Path:
     if _is_blank(value):
         raise StateCollectionError(f"{name} is required")
     path = Path(str(value).strip()).expanduser()
-    if not path.is_absolute():
-        path = base / path
-    return path.resolve()
+    if path.is_absolute():
+        return path.resolve()
+    manifest_relative = (base / path).resolve()
+    project_relative = (PROJECT_ROOT / path).resolve()
+    if manifest_relative.exists():
+        return manifest_relative
+    if project_relative.exists():
+        return project_relative
+    return manifest_relative
+
+
+def _load_behavior_labels(
+    path: Path,
+) -> dict[tuple[str, str, int], Mapping[str, Any]]:
+    """Load hash-bound explicit labels keyed by case, pair, and step."""
+
+    labels: dict[tuple[str, str, int], Mapping[str, Any]] = {}
+    for line_number, row in enumerate(_read_json_lines(path), start=1):
+        if row.get("format") != BEHAVIOR_LABEL_FORMAT:
+            raise StateCollectionError(
+                f"{path}:{line_number}: format must be "
+                f"{BEHAVIOR_LABEL_FORMAT!r}"
+            )
+        version = row.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != BEHAVIOR_LABEL_VERSION
+        ):
+            raise StateCollectionError(
+                f"{path}:{line_number}: version must be "
+                f"{BEHAVIOR_LABEL_VERSION}"
+            )
+        case_id = str(row.get("case_id", "")).strip()
+        pair_id = str(row.get("pair_id", "")).strip()
+        raw_step = row.get("step")
+        if not case_id or not pair_id:
+            raise StateCollectionError(
+                f"{path}:{line_number}: case_id and pair_id are required"
+            )
+        if isinstance(raw_step, bool) or not isinstance(raw_step, int) or raw_step < 0:
+            raise StateCollectionError(
+                f"{path}:{line_number}: step must be a non-negative integer"
+            )
+        response = row.get("response")
+        if not isinstance(response, str):
+            raise StateCollectionError(
+                f"{path}:{line_number}: response must be a string"
+            )
+        response_digest = _required_sha256(
+            row.get("response_sha256"),
+            name=f"{path}:{line_number}: response_sha256",
+        )
+        if response_digest != hashlib.sha256(response.encode("utf-8")).hexdigest():
+            raise StateCollectionError(
+                f"{path}:{line_number}: response_sha256 does not match response"
+            )
+        experiment_fingerprint = _required_sha256(
+            row.get("experiment_fingerprint"),
+            name=f"{path}:{line_number}: experiment_fingerprint",
+        )
+        checkpoint_digest = _required_sha256(
+            row.get("checkpoint_sha256"),
+            name=f"{path}:{line_number}: checkpoint_sha256",
+        )
+        if _is_blank(row.get("checkpoint_path")):
+            raise StateCollectionError(
+                f"{path}:{line_number}: checkpoint_path is required"
+            )
+        generation_status = str(row.get("generation_status", "")).strip().casefold()
+        if generation_status not in {"ok", "error"}:
+            raise StateCollectionError(
+                f"{path}:{line_number}: generation_status must be 'ok' or 'error'"
+            )
+        status = str(row.get("label_status", "")).strip().casefold()
+        if status not in {"ok", "unknown"}:
+            raise StateCollectionError(
+                f"{path}:{line_number}: label_status must be 'ok' or 'unknown'"
+            )
+        if status == "ok" and generation_status != "ok":
+            raise StateCollectionError(
+                f"{path}:{line_number}: label_status='ok' requires "
+                "generation_status='ok'"
+            )
+        if generation_status == "error" and status != "unknown":
+            raise StateCollectionError(
+                f"{path}:{line_number}: generation_status='error' requires "
+                "label_status='unknown'"
+            )
+        if status == "ok":
+            refusal = _optional_bool(
+                row.get("refusal_label"), name="behavior refusal_label"
+            )
+            compliance = _optional_bool(
+                row.get("compliance_label"), name="behavior compliance_label"
+            )
+            success = _optional_bool(
+                row.get("jailbreak_success"), name="behavior jailbreak_success"
+            )
+            if refusal is None or compliance is None or success is None:
+                raise StateCollectionError(
+                    f"{path}:{line_number}: ok labels require explicit refusal, "
+                    "compliance, and jailbreak values"
+                )
+            if compliance != success or (refusal and compliance):
+                raise StateCollectionError(
+                    f"{path}:{line_number}: inconsistent explicit behavior labels"
+                )
+        identity = (case_id, pair_id, raw_step)
+        if identity in labels:
+            raise StateCollectionError(
+                f"{path}:{line_number}: duplicate behavior-label identity {identity}"
+            )
+        normalized = dict(row)
+        normalized["format"] = BEHAVIOR_LABEL_FORMAT
+        normalized["version"] = BEHAVIOR_LABEL_VERSION
+        normalized["generation_status"] = generation_status
+        normalized["label_status"] = status
+        normalized["response_sha256"] = response_digest
+        normalized["experiment_fingerprint"] = experiment_fingerprint
+        normalized["checkpoint_sha256"] = checkpoint_digest
+        labels[identity] = normalized
+    if not labels:
+        raise StateCollectionError(f"Behavior-label sidecar is empty: {path}")
+    return labels
 
 
 def _read_manifest(
@@ -477,6 +686,7 @@ def _trajectory_example(
     checkpoint: TrajectoryCheckpoint,
     *,
     pair_row: Mapping[str, Any],
+    behavior_label: Optional[Mapping[str, Any]] = None,
 ) -> tuple[dict[str, Any], Any]:
     import torch
 
@@ -511,15 +721,37 @@ def _trajectory_example(
         raise StateCollectionError(
             f"checkpoint pair_id {owner!r} does not match manifest pair_id {pair_id!r}"
         )
-    response_value = _metadata_lookup(metadata, _RESPONSE_KEYS)
-    response = "" if _is_blank(response_value) else str(response_value).strip()
-    refusal_value = _metadata_lookup(metadata, _REFUSAL_KEYS)
-    refusal = _optional_bool(refusal_value, name="trajectory refusal")
-    success_value = _metadata_lookup(metadata, _SUCCESS_KEYS)
-    success = _optional_bool(success_value, name="trajectory success")
-    if refusal is None and success is not None:
-        refusal = not success
+    case_value = _metadata_lookup(metadata, ("case_id",))
+    if _is_blank(case_value):
+        case_value = pair_row.get("case_id")
+    case_id = "" if _is_blank(case_value) else str(case_value).strip()
+    if behavior_label is None:
+        response_value = _metadata_lookup(metadata, _RESPONSE_KEYS)
+        response = "" if _is_blank(response_value) else str(response_value).strip()
+        refusal_value = _metadata_lookup(metadata, _REFUSAL_KEYS)
+        refusal = _optional_bool(refusal_value, name="trajectory refusal")
+        success_value = _metadata_lookup(metadata, _SUCCESS_KEYS)
+        success = _optional_bool(success_value, name="trajectory success")
+        response_sha256 = None
+        experiment_fingerprint = None
+        checkpoint_sha256 = None
+        compliance = None
+    else:
+        response = str(behavior_label["response"])
+        refusal = _optional_bool(
+            behavior_label.get("refusal_label"), name="behavior refusal_label"
+        )
+        success = _optional_bool(
+            behavior_label.get("jailbreak_success"), name="behavior jailbreak_success"
+        )
+        compliance = _optional_bool(
+            behavior_label.get("compliance_label"), name="behavior compliance_label"
+        )
+        response_sha256 = str(behavior_label["response_sha256"])
+        experiment_fingerprint = str(behavior_label["experiment_fingerprint"])
+        checkpoint_sha256 = str(behavior_label["checkpoint_sha256"])
     example = {
+        "case_id": case_id,
         "pair_id": pair_id,
         "source": str(pair_row.get("source", "")),
         "stratum": str(pair_row.get("stratum", "")),
@@ -530,15 +762,22 @@ def _trajectory_example(
         "harmfulness_label": 1,
         "refusal_label": refusal,
         "jailbreak_success": success,
+        "compliance_label": compliance,
+        "response_sha256": response_sha256,
+        "experiment_fingerprint": experiment_fingerprint,
+        "checkpoint_sha256": checkpoint_sha256,
         "origin": "trajectory",
         "step": checkpoint.step,
         "checkpoint_path": str(checkpoint.path),
+        "measurement_split": pair_row.get("measurement_split"),
+        "stage1_role": pair_row.get("stage1_role"),
+        "probe_split": pair_row.get("probe_split"),
     }
     return example, waveform
 
 
 def _judge_response(judge: Any, prompt: str, response: str) -> tuple[bool, Mapping[str, Any]]:
-    """Normalize unified behavior decisions and refusal-only judge mappings."""
+    """Require an explicit refusal decision from a judge result."""
 
     if hasattr(judge, "evaluate"):
         result = judge.evaluate(prompt, response)
@@ -549,22 +788,23 @@ def _judge_response(judge: Any, prompt: str, response: str) -> tuple[bool, Mappi
     if hasattr(result, "as_dict") and callable(result.as_dict):
         result = result.as_dict()
     elif isinstance(result, bool):
-        result = {"attack_success": result, "refusal": not result}
+        raise StateCollectionError(
+            "a boolean judge result is ambiguous; return an explicit refusal field"
+        )
     if not isinstance(result, Mapping):
         raise StateCollectionError(
-            "judge must return a bool, mapping, or behavior decision"
+            "judge must return a mapping or behavior decision"
         )
     normalized = dict(result)
     refusal_value = _metadata_lookup(normalized, _REFUSAL_KEYS)
     success_value = _metadata_lookup(normalized, _SUCCESS_KEYS)
     refusal = _optional_bool(refusal_value, name="judge refusal")
     success = _optional_bool(success_value, name="judge attack_success")
-    if refusal is None and success is None:
-        raise StateCollectionError(
-            "judge result must contain refusal or attack_success/jailbroken"
-        )
     if refusal is None:
-        refusal = not success
+        raise StateCollectionError(
+            "judge result must contain an explicit refusal label; "
+            "attack_success cannot infer refusal"
+        )
     normalized.setdefault("refusal", refusal)
     if success is not None:
         normalized.setdefault("attack_success", success)
@@ -713,8 +953,8 @@ def _append_collected_row(
     refusal_labels: list[int],
     behavior_labels: list[dict[str, Any]],
 ) -> None:
-    response = str(example.get("response") or "").strip()
-    if not response and generate_missing_responses:
+    response = str(example.get("response") or "")
+    if not response.strip() and generate_missing_responses:
         response = _generate_response(model, waveform, max_tokens=max_tokens)
     refusal = _optional_bool(example.get("refusal_label"), name="refusal_label")
     judge_result: Optional[Mapping[str, Any]] = None
@@ -771,11 +1011,17 @@ def _append_collected_row(
         "refusal": int(refusal),
         "jailbreak_success": success,
     }
+    compliance = _optional_bool(
+        example.get("compliance_label"), name="compliance_label"
+    )
+    if compliance is not None:
+        behavior["compliance"] = compliance
     if judge_result is not None:
         behavior["judge"] = judge_result
     metadata = {
         "row_index": len(row_metadata),
         "pair_id": pair_id,
+        "case_id": str(example.get("case_id", "")),
         "state": state,
         "step": None if step < 0 else step,
         "source": str(example.get("source", "")),
@@ -788,6 +1034,26 @@ def _append_collected_row(
         "refusal_label": int(refusal),
         "jailbreak_success": success,
     }
+    for provenance_name in ("measurement_split", "stage1_role", "probe_split"):
+        provenance_value = example.get(provenance_name)
+        if not _is_blank(provenance_value):
+            metadata[provenance_name] = str(provenance_value).strip()
+    response_sha256 = example.get("response_sha256")
+    if not _is_blank(response_sha256):
+        actual_digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        if str(response_sha256) != actual_digest:
+            raise StateCollectionError("behavior-label response hash changed during merge")
+        metadata["response_sha256"] = actual_digest
+        behavior["response_sha256"] = actual_digest
+    for provenance_name in ("experiment_fingerprint", "checkpoint_sha256"):
+        provenance_value = example.get(provenance_name)
+        if not _is_blank(provenance_value):
+            digest = _required_sha256(
+                provenance_value,
+                name=f"behavior-label {provenance_name}",
+            )
+            metadata[provenance_name] = digest
+            behavior[provenance_name] = digest
     if example.get("checkpoint_path"):
         metadata["checkpoint_path"] = str(example["checkpoint_path"])
     if judge_result is not None:
@@ -937,8 +1203,19 @@ def validate_collection_payload(
             raise StateCollectionError(f"row_metadata[{index}] labels disagree")
         if behavior_values != (harmfulness, refusal):
             raise StateCollectionError(f"behavior_labels[{index}] labels disagree")
-    declared = payload.get("metadata", {}).get("require_triplets", False)
-    requested = set(payload.get("metadata", {}).get("requested_states", ()))
+    payload_metadata = payload.get("metadata", {})
+    if not isinstance(payload_metadata, Mapping):
+        raise StateCollectionError("metadata must be a mapping")
+    model_provenance = payload_metadata.get("model_provenance")
+    if model_provenance is not None:
+        normalized_provenance = _normalize_model_provenance(model_provenance)
+        for name, expected in normalized_provenance.items():
+            if payload_metadata.get(name) != expected:
+                raise StateCollectionError(
+                    f"metadata.{name} must agree with metadata.model_provenance"
+                )
+    declared = payload_metadata.get("require_triplets", False)
+    requested = set(payload_metadata.get("requested_states", ()))
     if declared:
         for pair_id in dict.fromkeys(payload["pair_ids"]):
             present = base_by_pair.get(pair_id, set())
@@ -956,6 +1233,7 @@ def collect_safety_states(
     output_path: str | Path | None = None,
     audio_loader: Optional[Callable[..., Any]] = None,
     judge: Any = None,
+    behavior_labels: str | Path | None = None,
     manifest_base: str | Path | None = None,
     states: Iterable[str] = BASE_STATES,
     require_triplets: bool = True,
@@ -970,6 +1248,7 @@ def collect_safety_states(
     max_tokens: int = 100,
     require_existing_audio: bool = True,
     shard_size: Optional[int] = None,
+    model_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Mapping[str, Any]:
     """Collect pooled states into a leakage-safe dual-probe training payload."""
 
@@ -999,10 +1278,22 @@ def collect_safety_states(
         isinstance(shard_size, bool) or not isinstance(shard_size, int) or shard_size <= 0
     ):
         raise ValueError("shard_size must be a positive integer")
+    normalized_model_provenance = (
+        None
+        if model_provenance is None
+        else _normalize_model_provenance(model_provenance)
+    )
 
     canonical, base, source_path = _read_manifest(
         manifest, manifest_base=manifest_base
     )
+    behavior_labels_path: Optional[Path] = None
+    explicit_behavior_labels: dict[tuple[str, str, int], Mapping[str, Any]] = {}
+    if behavior_labels is not None:
+        behavior_labels_path = _resolve_local_path(
+            base, behavior_labels, name="behavior_labels"
+        )
+        explicit_behavior_labels = _load_behavior_labels(behavior_labels_path)
     examples, selected_pair_ids = _state_rows(
         canonical, states=selected_states, require_triplets=require_triplets
     )
@@ -1026,7 +1317,8 @@ def collect_safety_states(
     responses: list[str] = []
     harmfulness_labels: list[int] = []
     refusal_labels: list[int] = []
-    behavior_labels: list[dict[str, Any]] = []
+    collected_behavior_labels: list[dict[str, Any]] = []
+    trajectory_label_counts = {"ok": 0, "unknown_skipped": 0}
 
     for example in examples:
         pair_id = str(example["pair_id"])
@@ -1058,7 +1350,7 @@ def collect_safety_states(
             responses=responses,
             harmfulness_labels=harmfulness_labels,
             refusal_labels=refusal_labels,
-            behavior_labels=behavior_labels,
+            behavior_labels=collected_behavior_labels,
         )
 
     if include_trajectories:
@@ -1076,14 +1368,94 @@ def collect_safety_states(
             if source is None:
                 continue
             for checkpoint in load_trajectory_checkpoints(source, pair_id=pair_id):
+                checkpoint_case = _metadata_lookup(
+                    checkpoint.metadata, ("case_id",)
+                )
+                manifest_case = pair_row.get("case_id")
+                if not _is_blank(manifest_case):
+                    if _is_blank(checkpoint_case) or str(checkpoint_case).strip() != str(
+                        manifest_case
+                    ).strip():
+                        raise StateCollectionError(
+                            f"trajectory case_id {checkpoint_case!r} does not match "
+                            f"manifest case_id {str(manifest_case).strip()!r} for "
+                            f"pair_id {pair_id!r} step {checkpoint.step}"
+                        )
+                explicit_label = None
+                if explicit_behavior_labels:
+                    case_value = checkpoint_case
+                    if _is_blank(case_value):
+                        case_value = pair_row.get("case_id")
+                    if _is_blank(case_value):
+                        raise StateCollectionError(
+                            f"pair_id {pair_id!r} step {checkpoint.step} has no case_id "
+                            "for behavior-label joining"
+                        )
+                    identity = (str(case_value).strip(), pair_id, checkpoint.step)
+                    explicit_label = explicit_behavior_labels.get(identity)
+                    if explicit_label is None:
+                        raise StateCollectionError(
+                            f"No behavior label for case_id={identity[0]!r}, "
+                            f"pair_id={pair_id!r}, step={checkpoint.step}"
+                        )
+                    raw_checkpoint = explicit_label["checkpoint_path"]
+                    label_checkpoint = Path(str(raw_checkpoint)).expanduser()
+                    if not label_checkpoint.is_absolute():
+                        assert behavior_labels_path is not None
+                        label_checkpoint = behavior_labels_path.parent / label_checkpoint
+                    if label_checkpoint.resolve() != checkpoint.path.resolve():
+                        raise StateCollectionError(
+                            f"Behavior label checkpoint does not match trajectory "
+                            f"for {identity}"
+                        )
+
+                    label_fingerprint = str(
+                        explicit_label["experiment_fingerprint"]
+                    )
+                    checkpoint_fingerprint = _required_sha256(
+                        _metadata_lookup(
+                            checkpoint.metadata, ("experiment_fingerprint",)
+                        ),
+                        name=(
+                            "trajectory checkpoint metadata experiment_fingerprint "
+                            f"for {identity}"
+                        ),
+                    )
+                    if label_fingerprint != checkpoint_fingerprint:
+                        raise StateCollectionError(
+                            "Behavior label experiment_fingerprint does not match "
+                            f"trajectory checkpoint metadata for {identity}"
+                        )
+
+                    expected_checkpoint_digest = str(
+                        explicit_label["checkpoint_sha256"]
+                    )
+                    actual_checkpoint_digest = _file_sha256(checkpoint.path)
+                    if expected_checkpoint_digest != actual_checkpoint_digest:
+                        raise StateCollectionError(
+                            "Behavior label checkpoint_sha256 does not match the "
+                            f"checkpoint contents for {identity}"
+                        )
+
+                    if (
+                        str(explicit_label.get("label_status", ""))
+                        .strip()
+                        .casefold()
+                        == "unknown"
+                    ):
+                        trajectory_label_counts["unknown_skipped"] += 1
+                        continue
+                    trajectory_label_counts["ok"] += 1
                 example, waveform = _trajectory_example(
-                    checkpoint, pair_row=pair_row
+                    checkpoint,
+                    pair_row=pair_row,
+                    behavior_label=explicit_label,
                 )
                 _append_collected_row(
                     example=example,
                     waveform=waveform,
                     model=model,
-                    judge=judge,
+                    judge=None if explicit_label is not None else judge,
                     generate_missing_responses=generate_missing_responses,
                     max_tokens=max_tokens,
                     layers=normalized_layers,
@@ -1098,7 +1470,7 @@ def collect_safety_states(
                     responses=responses,
                     harmfulness_labels=harmfulness_labels,
                     refusal_labels=refusal_labels,
-                    behavior_labels=behavior_labels,
+                    behavior_labels=collected_behavior_labels,
                 )
 
     hidden_states = OrderedDict(
@@ -1118,7 +1490,7 @@ def collect_safety_states(
         "steps": torch.tensor(steps, dtype=torch.int64),
         "layers": list(hidden_states),
         "responses": responses,
-        "behavior_labels": behavior_labels,
+        "behavior_labels": collected_behavior_labels,
         "row_metadata": row_metadata,
         "metadata": {
             "manifest": None if source_path is None else str(source_path),
@@ -1131,6 +1503,32 @@ def collect_safety_states(
             "token_span": token_span,
             "sequence_has_embedding": bool(sequence_has_embedding),
             "layers": list(hidden_states),
+            "measurement_splits": sorted(
+                {
+                    str(row["measurement_split"])
+                    for row in row_metadata
+                    if not _is_blank(row.get("measurement_split"))
+                }
+            ),
+            "stage1_roles": sorted(
+                {
+                    str(row["stage1_role"])
+                    for row in row_metadata
+                    if not _is_blank(row.get("stage1_role"))
+                }
+            ),
+            "behavior_labels": (
+                None if behavior_labels_path is None else str(behavior_labels_path)
+            ),
+            "trajectory_label_counts": trajectory_label_counts,
+            **(
+                {}
+                if normalized_model_provenance is None
+                else {
+                    "model_provenance": dict(normalized_model_provenance),
+                    **dict(normalized_model_provenance),
+                }
+            ),
         },
     }
     validate_collection_payload(payload)
@@ -1339,6 +1737,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unpaired", action="store_true")
     parser.add_argument("--no-trajectories", action="store_true")
     parser.add_argument("--trajectory-column", default="trajectory_path")
+    parser.add_argument(
+        "--behavior-labels",
+        type=Path,
+        default=None,
+        help="Explicit hash-bound trajectory labels from evaluate_stage1_behavior",
+    )
     parser.add_argument("--no-generate-missing-responses", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--allow-missing-audio-files", action="store_true")
@@ -1383,6 +1787,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_path=args.output,
         audio_loader=audio_loader,
         judge=judge,
+        behavior_labels=args.behavior_labels,
         states=states,
         require_triplets=not args.allow_unpaired,
         layers=args.layers,
@@ -1394,6 +1799,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_tokens=args.max_tokens,
         require_existing_audio=not args.allow_missing_audio_files,
         shard_size=args.shard_size,
+        model_provenance=build_model_provenance(
+            args.model, args.model_id, args.dtype
+        ),
     )
     print(
         f"Saved {len(payload['pair_ids'])} state rows across "
@@ -1413,6 +1821,7 @@ __all__ = [
     "StateCollectionError",
     "TrajectoryCheckpoint",
     "atomic_torch_save",
+    "build_model_provenance",
     "build_parser",
     "collect_safety_states",
     "load_trajectory_checkpoints",

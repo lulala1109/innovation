@@ -190,6 +190,73 @@ class BatchSafetyAttackTests(unittest.TestCase):
             )
             self.assertEqual(resumed["counts"]["skipped"], 1)
 
+    def test_save_all_steps_writes_complete_trajectory_and_case_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "runs"
+
+            summary = batch.run_batch(
+                self._manifest(root),
+                output,
+                method="standard",
+                steps=3,
+                early_stop=False,
+                save_all_steps=True,
+                capture_checkpoint_behavior=False,
+                determinism="off",
+                model_factory=self._model_factory,
+                attacker_factory=lambda **_kwargs: FakeAttacker(),
+                audio_loader=self._audio_loader,
+                audio_saver=self._audio_saver,
+            )
+
+            self.assertEqual(summary["counts"]["completed"], 1)
+            case_dir = next(path for path in output.iterdir() if path.is_dir())
+            with (case_dir / "trajectory" / "index.json").open(
+                "r", encoding="utf-8"
+            ) as handle:
+                index = json.load(handle)
+            self.assertEqual(
+                [item["step"] for item in index["checkpoints"]],
+                [0, 1, 2, 3],
+            )
+            for item in index["checkpoints"]:
+                metadata = item["metadata"]
+                self.assertEqual(metadata["case_id"], "case-alpha")
+                self.assertEqual(metadata["pair_id"], "pair-alpha")
+                self.assertEqual(metadata["step"], item["step"])
+                self.assertNotIn("behavior", metadata)
+
+            with (case_dir / "run.json").open("r", encoding="utf-8") as handle:
+                run = json.load(handle)
+            config = run["budget"]["experiment_config"]
+            self.assertTrue(config["save_all_steps"])
+            self.assertFalse(config["capture_checkpoint_behavior"])
+            self.assertEqual(config["checkpoint_steps"], [0, 1, 2, 3])
+
+    def test_checkpoint_step_selection_rejects_conflicting_policies(self) -> None:
+        self.assertEqual(
+            batch._parse_checkpoint_steps(None, 100),
+            (0, 25, 50, 75, 100),
+        )
+        self.assertEqual(
+            batch._parse_checkpoint_steps(None, 3, save_all_steps=True),
+            (0, 1, 2, 3),
+        )
+        self.assertEqual(
+            batch._parse_checkpoint_steps(None, 0, save_all_steps=True),
+            (0,),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "save_all_steps cannot be combined with checkpoint_steps",
+        ):
+            batch._parse_checkpoint_steps(
+                (0, 1),
+                1,
+                save_all_steps=True,
+            )
+
     def test_jbb_aliases_and_project_root_audio_path_are_supported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -282,6 +349,45 @@ class BatchSafetyAttackTests(unittest.TestCase):
             self.assertEqual(
                 len(run["budget"]["experiment_fingerprint"]), 64
             )
+
+    def test_checkpoint_policy_is_part_of_experiment_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._manifest(root)
+            output = root / "runs"
+            calls: list[dict] = []
+
+            def model_factory(**kwargs):
+                calls.append(kwargs)
+                return FakeModel()
+
+            common = {
+                "method": "standard",
+                "steps": 2,
+                "early_stop": False,
+                "determinism": "off",
+                "model_factory": model_factory,
+                "attacker_factory": lambda **_kwargs: FakeAttacker(),
+                "audio_loader": self._audio_loader,
+                "audio_saver": self._audio_saver,
+            }
+            batch.run_batch(
+                manifest,
+                output,
+                save_all_steps=True,
+                **common,
+            )
+            changed = batch.run_batch(
+                manifest,
+                output,
+                checkpoint_steps=(0, 1, 2),
+                save_all_steps=False,
+                **common,
+            )
+
+            self.assertEqual(changed["counts"]["skipped"], 0)
+            self.assertEqual(changed["counts"]["completed"], 1)
+            self.assertEqual(len(calls), 2)
 
     def test_failure_is_isolated_in_error_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -452,13 +558,35 @@ class BatchSafetyAttackTests(unittest.TestCase):
                     "--model-id",
                     "local/qwen",
                     "--no-early-stop",
+                    "--save-all-steps",
+                    "--no-capture-checkpoint-behavior",
                 ]
             )
         self.assertEqual(exit_code, 0)
         kwargs = runner.call_args.kwargs
         self.assertNotIn("no_early_stop", kwargs)
+        self.assertNotIn("no_capture_checkpoint_behavior", kwargs)
         self.assertFalse(kwargs["early_stop"])
+        self.assertTrue(kwargs["save_all_steps"])
+        self.assertFalse(kwargs["capture_checkpoint_behavior"])
         self.assertEqual(kwargs["model_id"], "local/qwen")
+
+    def test_cli_rejects_save_all_steps_with_explicit_checkpoints(self) -> None:
+        parser = batch.build_parser()
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                parser.parse_args(
+                    [
+                        "--manifest",
+                        "manifest.csv",
+                        "--output-dir",
+                        "runs",
+                        "--checkpoint-steps",
+                        "0,2",
+                        "--save-all-steps",
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,10 @@ import numpy as np
 from pathlib import Path
 
 
+#阶段一数据集划分为训练集和测试集
+
+
+
 INPUT_PATH = Path(
     "dataset/processed/stage1/jbb_pairs_base.csv"
 )

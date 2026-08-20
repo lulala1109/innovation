@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,9 @@ import torch
 
 from experiments.batch_safety_attack import _default_probe_loader
 from experiments.train_safety_probes import (
+    build_parser,
     load_training_payload,
+    split_pair_group_folds,
     split_pair_groups,
     train_probe_checkpoint,
     train_safety_probes,
@@ -58,6 +61,26 @@ def _training_payload(groups: int = 6):
 
 
 class TrainSafetyProbeTests(unittest.TestCase):
+    def test_group_kfold_is_deterministic_complete_and_pair_safe(self):
+        pair_ids = [f"p{index // 3}" for index in range(24)]
+        first = split_pair_group_folds(pair_ids, folds=5, seed=91)
+        second = split_pair_group_folds(pair_ids, folds=5, seed=91)
+        self.assertEqual(first, second)
+        validation_rows = []
+        for fold in first:
+            self.assertTrue(
+                set(fold.train_pair_ids).isdisjoint(fold.validation_pair_ids)
+            )
+            validation_rows.extend(fold.validation_indices)
+            for pair_id in set(pair_ids):
+                assignments = {
+                    index in fold.validation_indices
+                    for index, value in enumerate(pair_ids)
+                    if value == pair_id
+                }
+                self.assertEqual(len(assignments), 1)
+        self.assertEqual(sorted(validation_rows), list(range(len(pair_ids))))
+
     def test_group_split_is_deterministic_and_has_no_pair_leakage(self):
         pair_ids = ["p0", "p0", "p1", "p2", "p2", "p3"]
         first = split_pair_groups(
@@ -107,6 +130,145 @@ class TrainSafetyProbeTests(unittest.TestCase):
             for partition in ("train", "validation"):
                 for layer_metrics in checkpoint["metrics"][direction][partition].values():
                     self.assertGreaterEqual(layer_metrics["accuracy"], 0.99)
+
+    def test_v2_group_oof_metrics_directions_and_final_probe(self):
+        payload = _training_payload(groups=10)
+        checkpoint = train_safety_probes(
+            payload,
+            cv_folds=5,
+            seed=7,
+            epochs=30,
+            learning_rate=0.05,
+            bootstrap_replicates=40,
+        )
+        self.assertEqual(checkpoint["version"], 2)
+        self.assertEqual(
+            checkpoint["metadata"]["split"]["mode"], "pair_group_kfold_oof"
+        )
+        assignments = checkpoint["oof_predictions"]["fold_assignments"]
+        self.assertEqual(assignments.shape, (20,))
+        self.assertEqual(set(assignments.tolist()), set(range(5)))
+        for pair_id in set(payload["pair_ids"]):
+            pair_folds = {
+                int(assignments[index])
+                for index, value in enumerate(payload["pair_ids"])
+                if value == pair_id
+            }
+            self.assertEqual(len(pair_folds), 1)
+
+        for direction in ("harmfulness", "refusal"):
+            for layer in (2, 5):
+                means = checkpoint["class_means"][direction][layer]
+                expected = means["positive"] - means["negative"]
+                self.assertTrue(
+                    torch.allclose(checkpoint["directions"][direction][layer], expected)
+                )
+                probabilities = checkpoint["oof_predictions"]["probabilities"][
+                    direction
+                ][layer]
+                projections = checkpoint["oof_predictions"][
+                    "direction_projections"
+                ][direction][layer]
+                self.assertTrue(torch.isfinite(probabilities).all())
+                self.assertTrue(torch.isfinite(projections).all())
+                layer_metrics = checkpoint["metrics"][direction]["oof"][str(layer)]
+                for metric in ("auroc", "f1", "balanced_accuracy"):
+                    self.assertGreaterEqual(layer_metrics[metric], 0.99)
+                    interval = layer_metrics["bootstrap_95_ci"][metric]
+                    self.assertEqual(interval["requested_replicates"], 40)
+                    self.assertEqual(interval["method"], "pair_cluster_percentile")
+                self.assertEqual(
+                    layer_metrics["confusion_matrix"], [[10, 0], [0, 10]]
+                )
+                alignment = layer_metrics["probe_direction_alignment"]
+                self.assertGreaterEqual(alignment["spearman"], 0.8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe-v2.pt"
+            legacy_path = Path(directory) / "probe-v1.pt"
+            unsupported_path = Path(directory) / "probe-v3.pt"
+            torch.save(checkpoint, path)
+            legacy = {
+                "version": 1,
+                "hidden_sizes": checkpoint["hidden_sizes"],
+                "state_dict": checkpoint["state_dict"],
+            }
+            torch.save(legacy, legacy_path)
+            unsupported = dict(legacy)
+            unsupported["version"] = 3
+            torch.save(unsupported, unsupported_path)
+            scorer = _default_probe_loader(path)
+            legacy_scorer = _default_probe_loader(legacy_path)
+            with self.assertRaisesRegex(ValueError, "version must be 1 or 2"):
+                _default_probe_loader(unsupported_path)
+        self.assertFalse(scorer.training)
+        self.assertFalse(legacy_scorer.training)
+
+    def test_explicit_measurement_provenance_rejects_held_out_or_wrong_role(self):
+        payload = _training_payload()
+        payload["row_metadata"] = [
+            {
+                "measurement_split": "measurement_train",
+                "stage1_role": "probe_candidate",
+            }
+            for _ in payload["pair_ids"]
+        ]
+        validate_training_payload(payload)
+
+        payload["row_metadata"][3]["measurement_split"] = "measurement_val"
+        with self.assertRaisesRegex(ValueError, "only measurement_train"):
+            validate_training_payload(payload)
+        payload["row_metadata"][3]["measurement_split"] = "measurement_train"
+        payload["row_metadata"][3]["stage1_role"] = "trajectory_candidate"
+        with self.assertRaisesRegex(ValueError, "only probe_candidate"):
+            validate_training_payload(payload)
+
+        # Legacy payloads may have row metadata without the new provenance keys.
+        payload["row_metadata"] = [{} for _ in payload["pair_ids"]]
+        validate_training_payload(payload)
+        payload["row_metadata"][0]["measurement_split"] = "measurement_train"
+        with self.assertRaisesRegex(ValueError, "present on every row"):
+            validate_training_payload(payload)
+
+    def test_source_payload_hash_and_model_provenance_are_preserved(self):
+        payload = _training_payload()
+        payload["metadata"] = {
+            "pooling": "mean",
+            "token_span": "audio",
+            "layers": [2, 5],
+            "model_provenance": {
+                "source_model": "qwen-3b",
+                "model_id": "local/model",
+                "model_fingerprint": "a" * 64,
+                "dtype": "bfloat16",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "payload.pt"
+            output = Path(directory) / "probe.pt"
+            torch.save(payload, source)
+            expected_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            checkpoint = train_probe_checkpoint(
+                source,
+                output,
+                cv_folds=3,
+                epochs=4,
+                bootstrap_replicates=5,
+            )
+        provenance = checkpoint["metadata"]["provenance"]
+        self.assertEqual(provenance["source_payload_sha256"], expected_digest)
+        self.assertEqual(provenance["source_model"], "qwen-3b")
+        self.assertEqual(provenance["model_fingerprint"], "a" * 64)
+        self.assertEqual(provenance["pooling"], "mean")
+        self.assertEqual(provenance["token_span"], "audio")
+        self.assertEqual(
+            provenance["training_payload_metadata"], payload["metadata"]
+        )
+
+    def test_production_cli_defaults_to_five_group_folds(self):
+        args = build_parser().parse_args(["--input", "states.pt", "--output", "p.pt"])
+        self.assertEqual(args.cv_folds, 5)
+        self.assertEqual(args.bootstrap_replicates, 1000)
 
     def test_fixed_seed_reproduces_all_probe_parameters(self):
         options = dict(

@@ -233,11 +233,20 @@ def _validate_unique_cases(records: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _parse_checkpoint_steps(
-    checkpoint_steps: Optional[Iterable[int]], steps: int
+    checkpoint_steps: Optional[Iterable[int]],
+    steps: int,
+    *,
+    save_all_steps: bool = False,
 ) -> tuple[int, ...]:
     if steps < 0:
         raise ValueError("steps must be non-negative")
-    if checkpoint_steps is None:
+    if save_all_steps and checkpoint_steps is not None:
+        raise ValueError(
+            "save_all_steps cannot be combined with checkpoint_steps"
+        )
+    if save_all_steps:
+        values = set(range(steps + 1))
+    elif checkpoint_steps is None:
         values = {0, steps}
         if steps:
             values.update({steps // 4, steps // 2, (3 * steps) // 4})
@@ -342,9 +351,11 @@ def _safe_torch_load(path: str | Path) -> Any:
 def _default_probe_loader(path: str | Path) -> Any:
     """Load an explicit ``DualSafetyStateScorer`` state-dict checkpoint.
 
-    Accepted checkpoints contain ``state_dict`` plus either ``hidden_size`` or
-    ``hidden_sizes``.  Serialized arbitrary Python modules are intentionally not
-    accepted.
+    Version-1 and version-2 checkpoints contain ``state_dict`` plus either
+    ``hidden_size`` or ``hidden_sizes``. Version 2 may additionally carry
+    independent class-mean directions; the attack scorer still loads only the
+    explicitly trained probe parameters. Serialized arbitrary Python modules
+    are intentionally not accepted.
     """
 
     payload = _safe_torch_load(path)
@@ -353,6 +364,12 @@ def _default_probe_loader(path: str | Path) -> Any:
             "Probe checkpoint must be a mapping with 'state_dict' and "
             "'hidden_size' or 'hidden_sizes'"
         )
+    version = payload.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {
+        1,
+        2,
+    }:
+        raise ValueError("Probe checkpoint version must be 1 or 2")
     hidden_size = payload.get("hidden_sizes", payload.get("hidden_size"))
     if hidden_size is None:
         raise ValueError("Probe checkpoint does not declare hidden_size(s)")
@@ -563,6 +580,7 @@ def _build_snapshot_callback(
     store: Any,
     model: Any,
     case: Mapping[str, Any],
+    case_id: str,
     snapshot_fn: Optional[Callable[..., Any]],
     target_text: str,
     harmful_text: str,
@@ -578,6 +596,7 @@ def _build_snapshot_callback(
         }
         metadata: MutableMapping[str, Any] = dict(record)
         metadata["experiment_fingerprint"] = experiment_fingerprint
+        metadata["case_id"] = case_id
         metadata["pair_id"] = str(case.get("pair_id", ""))
         metadata["target_text"] = target_text
         metadata["harmful_text"] = harmful_text
@@ -669,6 +688,7 @@ def run_batch(
     check_every: int = 20,
     early_stop: bool = True,
     checkpoint_steps: Optional[Iterable[int]] = None,
+    save_all_steps: bool = False,
     seed: int = 42,
     determinism: str = "warn",
     probe_checkpoint: Optional[str | Path] = None,
@@ -758,7 +778,11 @@ def run_batch(
     if not math.isfinite(float(behavior_threshold)) or not 0 <= behavior_threshold <= 1:
         raise ValueError("behavior_threshold must be finite and within [0, 1]")
 
-    checkpoints = _parse_checkpoint_steps(checkpoint_steps, steps)
+    checkpoints = _parse_checkpoint_steps(
+        checkpoint_steps,
+        steps,
+        save_all_steps=save_all_steps,
+    )
 
     manifest = Path(manifest_path).resolve()
     output = Path(output_dir).resolve()
@@ -835,6 +859,7 @@ def run_batch(
             "determinism": determinism,
             "check_every": int(check_every),
             "early_stop": bool(early_stop),
+            "save_all_steps": bool(save_all_steps),
             "checkpoint_steps": list(checkpoints),
             "layers": None if layers is None else list(layers),
             "fixed_layer": fixed_layer,
@@ -1004,6 +1029,7 @@ def run_batch(
                 store=store,
                 model=model,
                 case=row,
+                case_id=case_id,
                 snapshot_fn=snapshot_fn,
                 target_text=per_case_target,
                 harmful_text=harmful_text,
@@ -1172,11 +1198,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-mode", choices=("zero", "random"), default="zero")
     parser.add_argument("--check-every", type=int, default=20)
     parser.add_argument("--no-early-stop", action="store_true")
-    parser.add_argument(
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
         "--checkpoint-steps",
         type=_comma_ints,
         default=None,
         help="Comma-separated completed-update states; default is five milestones",
+    )
+    checkpoint_group.add_argument(
+        "--save-all-steps",
+        action="store_true",
+        help="Save every completed-update state from t=0 through t=T",
+    )
+    parser.add_argument(
+        "--no-capture-checkpoint-behavior",
+        action="store_true",
+        help="Defer response generation and behavior evaluation for checkpoints",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1216,7 +1253,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(str(exc))
     options = vars(args)
     early_stop = not options.pop("no_early_stop")
-    summary = run_batch(**options, early_stop=early_stop)
+    capture_checkpoint_behavior = not options.pop(
+        "no_capture_checkpoint_behavior"
+    )
+    summary = run_batch(
+        **options,
+        early_stop=early_stop,
+        capture_checkpoint_behavior=capture_checkpoint_behavior,
+    )
     return 1 if summary["counts"]["failed"] else 0
 
 
