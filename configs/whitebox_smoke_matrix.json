@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "whitebox_audio_jailbreak_smoke",
+  "manifest": "../data/manifests/safety_pairs.csv",
+  "output_dir": "../runs/whitebox_smoke_matrix",
+  "include_core": true,
+  "seeds": [13],
+  "budget": {
+    "eps": 0.1,
+    "alpha": 0.005,
+    "steps": 2,
+    "loss_type": "margin",
+    "kappa": 5.0,
+    "init_mode": "zero",
+    "check_every": 1,
+    "early_stop": false
+  },
+  "shared": {
+    "model_name": "qwen-3b",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "determinism": "warn",
+    "probe_checkpoint": "../artifacts/probes/qwen_safety_state.pt",
+    "reference_refusal_path": "../artifacts/references/x_h_refusal.pt",
+    "layers": [8, 12, 16, 20, 24],
+    "state_loss_weight": 1.0,
+    "temperature": 1.0,
+    "token_span": "audio",
+    "pooling": "mean",
+    "checkpoint_steps": [0, 1, 2],
+    "verbose": false,
+    "fail_fast": true
+  },
+  "methods": {
+    "standard": {},
+    "fixed": {
+      "fixed_layer": 16
+    },
+    "uniform": {
+      "layers": [8, 12, 16, 20, 24]
+    },
+    "static_topk": {
+      "top_k": 3,
+      "static_topk_layers": [12, 16, 20]
+    },
+    "gradient_adaptive": {
+      "layers": [8, 12, 16, 20, 24]
+    },
+    "safety_state_adaptive": {
+      "layers": [8, 12, 16, 20, 24]
+    }
+  },
+  "sweeps": {
+    "mode": "one_factor",
+    "axes": {}
+  }
+}

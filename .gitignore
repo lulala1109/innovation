@@ -1,0 +1,95 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging and build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors, operating systems, and temporary/backup files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.fuse_hidden*
+*.swp
+*.swo
+*~
+*.orig
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+pytorch_model*.bin
+model*.bin
+checkpoint/
+checkpoints/
+weights/
+model_weights/
+pretrained_models/
+
+# Audio and other generated media
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.aac
+
+# Local datasets (keep /data/: it is a Python source package)
+/dataset/
+/datasets/
+*.arrow
+*.parquet
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Experiment artifacts, reports, and logs
+/artifacts/
+/runs/
+/outputs/
+/results/
+/reports/
+/logs/
+*.log
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+
+# Download/tool caches
+.cache/
+.huggingface/

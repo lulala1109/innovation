@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "name": "whitebox_audio_jailbreak_full",
+  "manifest": "../data/manifests/safety_pairs.csv",
+  "output_dir": "../runs/whitebox_full_matrix",
+  "include_core": true,
+  "seeds": [13, 29, 47],
+  "budget": {
+    "eps": 0.1,
+    "alpha": 0.005,
+    "steps": 100,
+    "loss_type": "margin",
+    "kappa": 5.0,
+    "init_mode": "zero",
+    "check_every": 20,
+    "early_stop": false
+  },
+  "shared": {
+    "model_name": "qwen-3b",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "determinism": "warn",
+    "probe_checkpoint": "../artifacts/probes/qwen_safety_state.pt",
+    "reference_refusal_path": "../artifacts/references/x_h_refusal.pt",
+    "layers": [8, 12, 16, 20, 24],
+    "state_loss_weight": 1.0,
+    "temperature": 1.0,
+    "token_span": "audio",
+    "pooling": "mean",
+    "checkpoint_steps": [0, 25, 50, 75, 100],
+    "verbose": false,
+    "fail_fast": false
+  },
+  "methods": {
+    "standard": {},
+    "fixed": {
+      "fixed_layer": 16
+    },
+    "uniform": {
+      "layers": [8, 12, 16, 20, 24]
+    },
+    "static_topk": {
+      "top_k": 3,
+      "static_topk_layers": [12, 16, 20]
+    },
+    "gradient_adaptive": {
+      "layers": [8, 12, 16, 20, 24]
+    },
+    "safety_state_adaptive": {
+      "layers": [8, 12, 16, 20, 24]
+    }
+  },
+  "sweeps": {
+    "mode": "one_factor",
+    "axes": {
+      "measurement": {
+        "apply_to": ["safety_state_adaptive"],
+        "variants": [
+          {
+            "name": "audio_max",
+            "description": "Keep the audio span and replace mean pooling with max pooling.",
+            "overrides": {
+              "token_span": "audio",
+              "pooling": "max"
+            }
+          },
+          {
+            "name": "target_mean",
+            "description": "Measure safety state over target-text tokens.",
+            "overrides": {
+              "token_span": "target",
+              "pooling": "mean"
+            }
+          },
+          {
+            "name": "all_mean",
+            "description": "Measure safety state over all prompt and target tokens.",
+            "overrides": {
+              "token_span": "all",
+              "pooling": "mean"
+            }
+          }
+        ]
+      },
+      "dynamic": {
+        "apply_to": ["safety_state_adaptive"],
+        "variants": [
+          {
+            "name": "fixed_control",
+            "description": "Replace per-step dynamic weighting with one fixed layer.",
+            "overrides": {
+              "method": "fixed"
+            }
+          },
+          {
+            "name": "uniform_control",
+            "description": "Replace per-step dynamic weighting with uniform layer weights.",
+            "overrides": {
+              "method": "uniform"
+            }
+          },
+          {
+            "name": "static_topk_control",
+            "description": "Replace per-step dynamic weighting with independently selected static top-k layers.",
+            "overrides": {
+              "method": "static_topk"
+            }
+          }
+        ]
+      },
+      "layer": {
+        "apply_to": ["safety_state_adaptive"],
+        "variants": [
+          {
+            "name": "early",
+            "description": "Use only early Thinker layers.",
+            "overrides": {
+              "layers": [4, 8, 12]
+            }
+          },
+          {
+            "name": "middle",
+            "description": "Use only middle Thinker layers.",
+            "overrides": {
+              "layers": [12, 16, 20]
+            }
+          },
+          {
+            "name": "late",
+            "description": "Use only late Thinker layers.",
+            "overrides": {
+              "layers": [20, 24, 28]
+            }
+          }
+        ]
+      },
+      "tau": {
+        "apply_to": ["safety_state_adaptive"],
+        "variants": [
+          {
+            "name": "tau_0.25",
+            "description": "Sharper dynamic layer allocation.",
+            "overrides": {
+              "temperature": 0.25
+            }
+          },
+          {
+            "name": "tau_0.5",
+            "description": "Moderately sharp dynamic layer allocation.",
+            "overrides": {
+              "temperature": 0.5
+            }
+          },
+          {
+            "name": "tau_2.0",
+            "description": "Smoother dynamic layer allocation.",
+            "overrides": {
+              "temperature": 2.0
+            }
+          }
+        ]
+      },
+      "lambda": {
+        "apply_to": ["safety_state_adaptive"],
+        "variants": [
+          {
+            "name": "lambda_0",
+            "description": "Disable the safety-state objective while preserving the attack budget.",
+            "overrides": {
+              "state_loss_weight": 0.0
+            }
+          },
+          {
+            "name": "lambda_0.25",
+            "description": "Down-weight the safety-state objective.",
+            "overrides": {
+              "state_loss_weight": 0.25
+            }
+          },
+          {
+            "name": "lambda_2.0",
+            "description": "Up-weight the safety-state objective.",
+            "overrides": {
+              "state_loss_weight": 2.0
+            }
+          }
+        ]
+      },
+      "checkpoint": {
+        "apply_to": [
+          "standard",
+          "fixed",
+          "uniform",
+          "static_topk",
+          "gradient_adaptive",
+          "safety_state_adaptive"
+        ],
+        "variants": [
+          {
+            "name": "endpoints",
+            "description": "Record only initialization and final state.",
+            "overrides": {
+              "checkpoint_steps": [0, 100]
+            }
+          },
+          {
+            "name": "dense",
+            "description": "Record every ten optimization steps without changing the update budget.",
+            "overrides": {
+              "checkpoint_steps": [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
