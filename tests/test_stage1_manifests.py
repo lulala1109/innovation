@@ -76,11 +76,25 @@ class Stage1ManifestTests(unittest.TestCase):
         trajectory_pair="pair-a",
         unknown_steps=(),
         omitted_steps=(),
+        total_steps=1,
+        history_selected_step=None,
+        losses=None,
+        successful_steps=None,
+        tensor_checkpoints=False,
     ):
+        import torch
+
         case = root / "runs" / "case-a"
         trajectory = case / "trajectory"
         trajectory.mkdir(parents=True, exist_ok=True)
-        experiment_config = {"method": "standard", "steps": 1}
+        steps = tuple(range(total_steps + 1))
+        selected_step = (
+            total_steps if history_selected_step is None else history_selected_step
+        )
+        successful = (
+            {total_steps} if successful_steps is None else set(successful_steps)
+        )
+        experiment_config = {"method": "standard", "steps": total_steps}
         experiment_fingerprint = hashlib.sha256(
             json.dumps(
                 experiment_config,
@@ -88,8 +102,19 @@ class Stage1ManifestTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        for step in (0, 1):
-            (trajectory / f"step_{step:06d}.pt").write_bytes(b"checkpoint")
+        for step in steps:
+            checkpoint = trajectory / f"step_{step:06d}.pt"
+            if tensor_checkpoints:
+                torch.save(
+                    {
+                        "adversarial_wav": torch.full(
+                            (1, 8), float(step) / 10.0, dtype=torch.float32
+                        )
+                    },
+                    checkpoint,
+                )
+            else:
+                checkpoint.write_bytes(b"checkpoint")
         (case / "adversarial.wav").write_bytes(b"wave")
         (trajectory / "index.json").write_text(
             json.dumps(
@@ -107,18 +132,28 @@ class Stage1ManifestTests(unittest.TestCase):
                                 "experiment_fingerprint": experiment_fingerprint,
                             },
                         }
-                        for step in (0, 1)
+                        for step in steps
                     ],
                 }
             ),
             encoding="utf-8",
         )
+        history = {"selection": {"step": selected_step}}
+        if losses is not None:
+            history["iterations"] = [
+                {
+                    "step": step,
+                    "updates_completed": step,
+                    "loss": losses[step],
+                }
+                for step in steps
+            ]
         (case / "history.json").write_text(
             json.dumps(
                 {
                     "case_id": "case-a",
                     "pair_id": "pair-a",
-                    "history": {"selection": {"step": 1}},
+                    "history": history,
                 }
             ),
             encoding="utf-8",
@@ -130,7 +165,7 @@ class Stage1ManifestTests(unittest.TestCase):
                     "pair_id": "pair-a",
                     "method": "standard",
                     "budget": {
-                        "steps": 1,
+                        "steps": total_steps,
                         "experiment_config": experiment_config,
                         "experiment_fingerprint": experiment_fingerprint,
                     },
@@ -162,11 +197,12 @@ class Stage1ManifestTests(unittest.TestCase):
         )
         labels = root / "runs" / "behavior_labels.jsonl"
         with labels.open("w", encoding="utf-8") as handle:
-            for step in (0, 1):
+            for step in steps:
                 if step in omitted_steps:
                     continue
                 response = f"response-{step}"
                 unknown = step in unknown_steps
+                success = step in successful
                 checkpoint = trajectory / f"step_{step:06d}.pt"
                 handle.write(
                     json.dumps(
@@ -186,9 +222,9 @@ class Stage1ManifestTests(unittest.TestCase):
                             "response": response,
                             "response_sha256": response_sha256(response),
                             "label_status": "unknown" if unknown else "ok",
-                            "refusal_label": None if unknown else step == 0,
-                            "compliance_label": None if unknown else step == 1,
-                            "jailbreak_success": None if unknown else step == 1,
+                            "refusal_label": None if unknown else not success,
+                            "compliance_label": None if unknown else success,
+                            "jailbreak_success": None if unknown else success,
                         }
                     )
                     + "\n"
@@ -237,6 +273,131 @@ class Stage1ManifestTests(unittest.TestCase):
                     "experiment_fingerprint"
                 ],
             )
+
+
+    def test_attach_semantic_selection_ignores_lower_loss_refusal(self):
+        import soundfile as sf
+        import torch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.csv"
+            pd.DataFrame(
+                {
+                    "pair_id": ["pair-a"],
+                    "measurement_split": ["measurement_train"],
+                    "stage1_role": ["probe_candidate"],
+                    "category": ["cyber"],
+                    "benign_text": ["benign"],
+                    "harmful_text": ["harmful"],
+                }
+            ).to_csv(source, index=False)
+            summary, labels = self._write_attack_artifacts(
+                root,
+                total_steps=2,
+                history_selected_step=2,
+                losses={0: 0.75, 1: 0.5, 2: 0.25},
+                successful_steps=(0, 1),
+                tensor_checkpoints=True,
+            )
+
+            attached = attach_attack_outputs(
+                source,
+                summary,
+                labels,
+                root / "semantic_attached.csv",
+                project_root=root,
+                selection_policy="semantic-success-lowest-loss",
+                selected_audio_dir=root / "selected_audio",
+                selected_audio_sample_rate=16_000,
+            )
+
+            self.assertEqual(len(attached), 1)
+            self.assertEqual(attached.loc[0, "selected_attack_step"], 1)
+            self.assertEqual(attached.loc[0, "history_selected_attack_step"], 2)
+            self.assertEqual(
+                attached.loc[0, "attack_selection_policy"],
+                "semantic-success-lowest-loss",
+            )
+            self.assertEqual(attached.loc[0, "selected_attack_loss"], 0.5)
+            self.assertEqual(attached.loc[0, "semantic_successful_steps"], 2)
+            self.assertEqual(attached.loc[0, "jailbreak_response"], "response-1")
+            self.assertTrue(bool(attached.loc[0, "jailbreak_success"]))
+            self.assertTrue(
+                attached.loc[0, "selected_checkpoint_path"].endswith(
+                    "trajectory/step_000001.pt"
+                )
+            )
+
+            audio_path = root / attached.loc[0, "jailbreak_audio_path"]
+            waveform, sample_rate = sf.read(
+                audio_path, dtype="float32", always_2d=False
+            )
+            checkpoint = torch.load(
+                root / attached.loc[0, "selected_checkpoint_path"],
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertEqual(sample_rate, 16_000)
+            self.assertTrue(
+                torch.equal(
+                    torch.from_numpy(waveform),
+                    checkpoint["adversarial_wav"].squeeze(0),
+                )
+            )
+            self.assertEqual(
+                attached.loc[0, "jailbreak_audio_sha256"],
+                sha256_file(audio_path),
+            )
+
+    def test_semantic_selection_requires_complete_known_success_labels(self):
+        scenarios = (
+            (
+                {"omitted_steps": (0,), "successful_steps": (1,)},
+                "incomplete_behavior_labels",
+            ),
+            (
+                {"unknown_steps": (0,), "successful_steps": (1,)},
+                "unknown_behavior_labels",
+            ),
+            ({"successful_steps": ()}, "no_semantic_jailbreak"),
+        )
+        for fixture_kwargs, expected_reason in scenarios:
+            with self.subTest(reason=expected_reason):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source = root / "source.csv"
+                    pd.DataFrame(
+                        {
+                            "pair_id": ["pair-a"],
+                            "measurement_split": ["measurement_train"],
+                            "stage1_role": ["probe_candidate"],
+                            "category": ["cyber"],
+                        }
+                    ).to_csv(source, index=False)
+                    summary, labels = self._write_attack_artifacts(
+                        root,
+                        losses={0: 1.0, 1: 0.5},
+                        tensor_checkpoints=True,
+                        **fixture_kwargs,
+                    )
+                    attached = attach_attack_outputs(
+                        source,
+                        summary,
+                        labels,
+                        root / "semantic_attached.csv",
+                        exclusions_path=root / "exclusions.csv",
+                        project_root=root,
+                        selection_policy="semantic-success-lowest-loss",
+                    )
+                    self.assertTrue(attached.empty)
+                    self.assertEqual(
+                        pd.read_csv(root / "exclusions.csv").loc[
+                            0, "exclusion_reason"
+                        ],
+                        expected_reason,
+                    )
+
 
     def test_nonselected_unknown_or_missing_label_does_not_drop_pair(self):
         for unknown_steps, omitted_steps in (((0,), ()), ((), (0,))):

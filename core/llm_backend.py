@@ -74,8 +74,8 @@ class LLMBackend:
         provider_env: str = "JUDGE_PROVIDER",
         model_env: str = "JUDGE_LLM_MODEL",
         base_url_env: str = "JUDGE_BASE_URL",
-        max_retries: int = 2,
-        timeout: float = 60.0,
+        max_retries: int = 3,
+        timeout: float = 180.0,
     ):
         selected_provider = (
             _nonempty(provider)

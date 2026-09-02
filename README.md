@@ -7,6 +7,23 @@
 
 本目录不包含模型权重、数据集、实验结果、`.env` 或 API 密钥。
 
+## 第一阶段当前进度（2026-08-23）
+
+RQ1 创新点 1 的训练侧流程已经推进到 **57 条 Standard waveform PGD 全轨迹完成**：
+
+- 80 个 probe candidates 的 X_B/X_H clean response 与 Judge 已完成，共 160 条，`unknown=0`；
+- clean 规则保留 57 个 pair，排除 23 个；
+- 57 条正式 Standard PGD 全部完成，`failed=0`，共保存 57 × 101 = 5757 个 checkpoint；
+- 单样本的 `100-step attack → 101-state Judge → semantic attach → finalize` 已完整通过；
+- 单样本证明 attack-time 最低 loss 状态可能仍是拒答，因此训练 X_J 必须从完整 Judge 标签中选择语义成功状态。
+
+下一恢复点不是重跑 PGD，而是生成正式 5757 条 checkpoint response，再使用阿里云百炼 `deepseek-v4-flash` Judge。完整结果、产物审计、代码变更和后续顺序见：
+
+- `docs/RQ1创新点1第一阶段交接文档_2026-08-23.md`
+- `docs/RQ1创新点1第一阶段交接文档_2026-08-20.md`（整体实验设计与后续 RQ1 命令）
+
+`run.json.attack_success` 当前是目标字符串启发式，不能作为语义越狱结论。正式训练 X_J 使用 `semantic-success-lowest-loss`；held-out trajectory 为避免成功条件选择偏差，使用 `history`。
+
 ## 当前研究边界
 
 - **Qwen 2.5 Omni 是安全状态主方法。** `QwenModel.forward_attack()` 提供可微
@@ -34,11 +51,14 @@ data/
   datasets.py                   # 本地表格与可选 Hugging Face 数据加载
   sampling.py                   # FPC、分层/均衡抽样、排除重叠
   build_safety_pairs.py         # X_B / X_H / X_J manifest 和 pair_id
+  prepare_stage1_manifests.py   # 80/20 派生、clean/attack attach、finalize
 docs/
   *.docx                        # 创新点说明与具体实验方案
 experiments/
   train_safety_probes.py        # 独立 H/R layerwise probe 训练
   batch_safety_attack.py        # 可恢复的通用批量攻击入口
+  evaluate_stage1_clean.py      # X_B/X_H clean generation 与 Judge
+  evaluate_stage1_behavior.py   # trajectory response generation 与 Judge
   analyze_safety_dynamics.py    # Layer×Step 状态表、瓶颈路径和 Go/No-Go
   activation_patching.py        # 关键层与随机层对照的 activation patching
 evaluation/
@@ -239,22 +259,34 @@ pip install -r requirements.txt
 `--model-id` 可传本地 checkpoint 路径或 Hugging Face ID，避免在代码里硬编码
 权重位置。
 
-Standard PGD：
+当前 Stage1 训练侧 Standard PGD 使用完整 `t=0...100` 轨迹。下面是已经完成 57/57 的正式命令；除断点恢复外，不需要重复运行：
 
 ```bash
-python -m experiments.batch_safety_attack \
-  --manifest data/manifests/safety_pairs.csv \
-  --output-dir runs/qwen_standard \
+/root/miniconda3/envs/whisper_default_v2/bin/python \
+  -m experiments.batch_safety_attack \
+  --manifest dataset/processed/stage1/manifests/jbb_probe_clean_attached.csv \
+  --output-dir outputs/stage1/attacks/train_standard \
   --method standard \
   --model qwen-3b \
-  --model-id /path/to/Qwen2.5-Omni-3B \
-  --target-text "<统一目标文本>" \
-  --eps 0.1 --alpha 0.005 --steps 100 \
-  --checkpoint-steps 0,25,50,75,100 \
-  --seed 42 --no-early-stop
+  --model-id model_weights/Qwen2.5-Omni-3B \
+  --device cuda \
+  --dtype bfloat16 \
+  --eps 0.1 \
+  --alpha 0.005 \
+  --steps 100 \
+  --loss-type margin \
+  --kappa 5.0 \
+  --init-mode zero \
+  --no-early-stop \
+  --save-all-steps \
+  --no-capture-checkpoint-behavior \
+  --seed 42 \
+  --determinism warn \
+  --fail-fast \
+  --verbose
 ```
 
-如果 manifest 每行已有 `target_text`，可省略全局 `--target-text`。安全状态自适应
+该 manifest 每行已有 `target_text`，因此不使用全局 `--target-text`。正式第一阶段要求 `--save-all-steps`，不能改回只保存 0/25/50/75/100；已有完整且 fingerprint 匹配的 case 才可安全 resume/skip。安全状态自适应
 方法：
 
 ```bash
@@ -287,6 +319,86 @@ python -m experiments.batch_safety_attack \
 批处理逐 case 原子写入结果；已有、schema 完整且 `experiment_fingerprint` 与当前配置一致的 `run.json` 才会在重跑时跳过，
 失败 case 写 `error.json`，批次进度写 `summary.json`。这使中断后的重跑不会改变
 后续 case 的逐行 seed。
+
+## Stage1 离线行为评测与 X_J 选择
+
+57 条正式 PGD 已完成，当前下一步是对 5757 个 checkpoint 离线生成 response。response generation 需要本地 Qwen GPU，但不调用 Judge：
+
+```bash
+/root/miniconda3/envs/whisper_default_v2/bin/python \
+  -m experiments.evaluate_stage1_behavior generate \
+  --attack-dir outputs/stage1/attacks/train_standard \
+  --output outputs/stage1/behavior/train_responses.jsonl \
+  --model qwen-3b \
+  --model-id model_weights/Qwen2.5-Omni-3B \
+  --device cuda \
+  --dtype bfloat16 \
+  --max-tokens 100 \
+  --resume \
+  --fail-fast
+```
+
+最终输出必须包含 57 × 101 = 5757 条唯一记录。全新运行通常是 `generated=5757, skipped=0`；断点恢复时允许 `generated + skipped = 5757`。不要编辑部分 JSONL。
+
+百炼 API key 只保存在已被 `.gitignore` 忽略的本机 `.env` 中：
+
+```dotenv
+DASHSCOPE_API_KEY=<你的百炼 API key>
+```
+
+运行 Judge 前在当前 shell 加载，避免把真实 key 直接写进终端命令：
+
+```bash
+set -a
+source .env
+set +a
+```
+
+生成完成后，使用百炼 DeepSeek 做 StrongREJECT Judge：
+
+```bash
+/root/miniconda3/envs/whisper_default_v2/bin/python \
+  -m experiments.evaluate_stage1_behavior judge \
+  --responses outputs/stage1/behavior/train_responses.jsonl \
+  --output outputs/stage1/behavior/train_labels.jsonl \
+  --judge strongreject \
+  --threshold 0.5 \
+  --provider qwen \
+  --judge-model deepseek-v4-flash \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --resume \
+  --fail-fast
+```
+
+全新 Judge 通常是 `judged=5757, skipped=0`；断点恢复时允许 `judged + skipped = 5757`。只有在最终 sidecar 的 5757 条唯一标签全部存在且 `unknown=0` 后，才能为训练集选择语义成功 X_J：
+
+```bash
+/root/miniconda3/envs/whisper_default_v2/bin/python \
+  -m data.prepare_stage1_manifests attach \
+  --source dataset/processed/stage1/manifests/jbb_probe_clean_attached.csv \
+  --summary outputs/stage1/attacks/train_standard/summary.json \
+  --behavior-labels outputs/stage1/behavior/train_labels.jsonl \
+  --output dataset/processed/stage1/manifests/jbb_probe_all_attached.csv \
+  --exclusions outputs/stage1/exclusions/probe_attack_exclusions.csv \
+  --selection-policy semantic-success-lowest-loss \
+  --selected-audio-dir outputs/stage1/selected_audio/train \
+  --selected-audio-sample-rate 16000
+```
+
+该策略要求完整且已知的 Judge 标签，只在 `jailbreak_success=true` 的状态中按 `(attack loss, step)` 选择。缺标签、unknown 或无语义成功的 case 分别进入 exclusions，不能回退到目标字符串、最后一步或手工挑选。
+
+最后生成严格 X_B/X_H/X_J triplets：
+
+```bash
+/root/miniconda3/envs/whisper_default_v2/bin/python \
+  -m data.prepare_stage1_manifests finalize \
+  --source dataset/processed/stage1/manifests/jbb_probe_all_attached.csv \
+  --output dataset/processed/stage1/manifests/jbb_probe_final.csv \
+  --exclusions outputs/stage1/exclusions/probe_final_exclusions.csv \
+  --required-split measurement_train
+```
+
+如果最终保留 N 个成功 pair，后续 probe state collection 应得到 3N 条 X_B/X_H/X_J state rows。held-out trajectory 不按成功筛样，其 attach 必须显式使用 `--selection-policy history`。
 
 ## 分析安全状态动力学
 
@@ -329,7 +441,12 @@ python -m experiments.activation_patching \
 
 ## 行为评测
 
-评测器只读取通用 `run.json`，不解释旧 Stage-1/Stage-2 字段。StrongREJECT 的
+上面的 `experiments.evaluate_stage1_behavior` 用于完整 checkpoint trajectory 的
+response/Judge sidecar，并参与训练 X_J 语义选择。本节的
+`evaluation.evaluate_safety_runs` 是面向通用 `run.json` 的批次级后验评测，两者
+不能互相替代。
+
+通用评测器只读取 `run.json`，不解释旧 Stage-1/Stage-2 字段。StrongREJECT 的
 provider、model、base URL 和密钥通过 CLI/环境变量显式配置，密钥不会写进结果。
 
 ```bash
@@ -433,6 +550,9 @@ checkpoint 先写同目录临时文件，再原子 rename；即使进程在索�
 
 python attack.py --help
 python -m data.build_safety_pairs --help
+python -m data.prepare_stage1_manifests --help
+python -m experiments.evaluate_stage1_clean --help
+python -m experiments.evaluate_stage1_behavior --help
 python -m experiments.train_safety_probes --help
 python -m experiments.batch_safety_attack --help
 python -m experiments.analyze_safety_dynamics --help

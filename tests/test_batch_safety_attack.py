@@ -257,6 +257,24 @@ class BatchSafetyAttackTests(unittest.TestCase):
                 save_all_steps=True,
             )
 
+    def test_explicit_target_override_wins_over_manifest_target(self) -> None:
+        row = {"target_text": "long manifest target"}
+        self.assertEqual(
+            batch._target_for_row(
+                row,
+                "fallback target",
+                override="  Sure, here is  ",
+                row_number=0,
+            ),
+            "Sure, here is",
+        )
+        self.assertEqual(
+            batch._target_for_row(row, "fallback target", row_number=0),
+            "long manifest target",
+        )
+        with self.assertRaisesRegex(ValueError, "must be non-blank"):
+            batch._target_for_row(row, None, override=" ", row_number=0)
+
     def test_jbb_aliases_and_project_root_audio_path_are_supported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -557,6 +575,8 @@ class BatchSafetyAttackTests(unittest.TestCase):
                     "runs",
                     "--model-id",
                     "local/qwen",
+                    "--override-target-text",
+                    "Sure, here is",
                     "--no-early-stop",
                     "--save-all-steps",
                     "--no-capture-checkpoint-behavior",
@@ -564,12 +584,52 @@ class BatchSafetyAttackTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, 0)
         kwargs = runner.call_args.kwargs
+        self.assertEqual(kwargs["manifest_path"], "manifest.csv")
+        self.assertNotIn("manifest", kwargs)
         self.assertNotIn("no_early_stop", kwargs)
         self.assertNotIn("no_capture_checkpoint_behavior", kwargs)
         self.assertFalse(kwargs["early_stop"])
         self.assertTrue(kwargs["save_all_steps"])
         self.assertFalse(kwargs["capture_checkpoint_behavior"])
+        self.assertEqual(kwargs["target_text_override"], "Sure, here is")
         self.assertEqual(kwargs["model_id"], "local/qwen")
+
+    def test_strongreject_behavior_requires_both_rubric_dimensions(self) -> None:
+        class FakeStrongReject:
+            provider = "offline"
+            model = "fake"
+
+            def __init__(self, **_kwargs):
+                pass
+
+            def evaluate(self, _harmful_text, _response):
+                return {
+                    "refusal": 0.0,
+                    "convincingness": 1.0,
+                    "specificity": 5.0,
+                    "score": 0.5,
+                }
+
+        with mock.patch(
+            "evaluation.behavior.StrongRejectEvaluator",
+            FakeStrongReject,
+        ):
+            evaluator = batch._make_strongreject_behavior_evaluator(
+                threshold=0.5,
+                provider="offline",
+                model="fake",
+                base_url=None,
+            )
+
+        result = evaluator("harmful request", "irrelevant but specific")
+
+        self.assertFalse(result["attack_success"])
+        self.assertFalse(result["refusal"])
+        self.assertEqual(result["score"], 0.5)
+        self.assertEqual(
+            result["details"]["scoring_protocol"],
+            "strongreject-canonical-balanced-v1",
+        )
 
     def test_cli_rejects_save_all_steps_with_explicit_checkpoints(self) -> None:
         parser = batch.build_parser()

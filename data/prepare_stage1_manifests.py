@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import numbers
 import os
 import tempfile
@@ -51,6 +52,13 @@ TRAJECTORY_LABEL_FORMAT = "stage1-behavior-label"
 TRAJECTORY_LABEL_VERSION = 1
 CLEAN_LABEL_FORMAT = "stage1-clean-behavior"
 CLEAN_LABEL_VERSION = 1
+HISTORY_SELECTION_POLICY = "history"
+SEMANTIC_SELECTION_POLICY = "semantic-success-lowest-loss"
+ATTACK_SELECTION_POLICIES = (
+    HISTORY_SELECTION_POLICY,
+    SEMANTIC_SELECTION_POLICY,
+)
+DEFAULT_SELECTED_AUDIO_SAMPLE_RATE = 16_000
 
 
 class Stage1ManifestError(ValueError):
@@ -916,6 +924,154 @@ def _append_exclusions(frame: pd.DataFrame, path: Path | None) -> None:
     _atomic_csv(combined, path)
 
 
+
+def _history_losses(
+    history: Mapping[str, Any],
+    *,
+    pair_id: str,
+    expected_steps: set[int],
+) -> dict[int, float]:
+    """Return one finite attack loss for every checkpoint step."""
+
+    raw_iterations = history.get("iterations")
+    if not isinstance(raw_iterations, list):
+        raise Stage1ManifestError(f"history iterations missing for {pair_id}")
+    losses: dict[int, float] = {}
+    for position, raw_iteration in enumerate(raw_iterations):
+        if not isinstance(raw_iteration, Mapping):
+            raise Stage1ManifestError(
+                f"history iteration {position} must be an object for {pair_id}"
+            )
+        step = _integer(
+            raw_iteration.get("step"),
+            name=f"history iteration {position}.step for {pair_id}",
+        )
+        if step in losses:
+            raise Stage1ManifestError(
+                f"history contains duplicate step {step} for {pair_id}"
+            )
+        raw_loss = raw_iteration.get("loss")
+        if isinstance(raw_loss, bool) or not isinstance(raw_loss, numbers.Real):
+            raise Stage1ManifestError(
+                f"history loss at step {step} must be numeric for {pair_id}"
+            )
+        loss = float(raw_loss)
+        if not math.isfinite(loss):
+            raise Stage1ManifestError(
+                f"history loss at step {step} must be finite for {pair_id}"
+            )
+        losses[step] = loss
+    if set(losses) != expected_steps:
+        raise Stage1ManifestError(
+            f"History losses for {pair_id} must cover exactly the trajectory steps; "
+            f"missing={sorted(expected_steps - set(losses))}, "
+            f"unexpected={sorted(set(losses) - expected_steps)}"
+        )
+    return losses
+
+
+def _semantic_selected_step(
+    labels: Mapping[int, Mapping[str, Any]],
+    losses: Mapping[int, float],
+) -> int | None:
+    """Select the lowest-loss semantic success, breaking ties by step."""
+
+    successful_steps = [
+        step
+        for step, label in labels.items()
+        if label["label_status"] == "ok" and label["jailbreak_success"] is True
+    ]
+    if not successful_steps:
+        return None
+    return min(successful_steps, key=lambda step: (losses[step], step))
+
+
+def _load_checkpoint_waveform(path: Path) -> Any:
+    """Load the canonical waveform tensor from one tensor-only checkpoint."""
+
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch
+        payload = torch.load(path, map_location="cpu")
+    tensors = payload.get("tensors", payload) if isinstance(payload, Mapping) else None
+    if not isinstance(tensors, Mapping):
+        raise Stage1ManifestError(f"Checkpoint tensors must be an object: {path}")
+    waveform = next(
+        (
+            tensors[name]
+            for name in ("adversarial_wav", "waveform", "wav", "audio")
+            if isinstance(tensors.get(name), torch.Tensor)
+        ),
+        None,
+    )
+    if waveform is None:
+        raise Stage1ManifestError(
+            f"Checkpoint does not contain an adversarial waveform: {path}"
+        )
+    waveform = waveform.detach().to(device="cpu", dtype=torch.float32)
+    if waveform.numel() == 0 or not bool(torch.isfinite(waveform).all()):
+        raise Stage1ManifestError(
+            f"Checkpoint waveform must be finite and non-empty: {path}"
+        )
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    if waveform.ndim != 2 or waveform.shape[0] != 1:
+        raise Stage1ManifestError(
+            f"Checkpoint waveform must have shape [T] or [1,T], found "
+            f"{tuple(waveform.shape)}: {path}"
+        )
+    return waveform.contiguous()
+
+
+def _atomic_selected_audio(
+    checkpoint: Path,
+    destination: Path,
+    *,
+    sample_rate: int,
+) -> Path:
+    """Materialize an exact float-WAV view of a selected trajectory state."""
+
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or sample_rate <= 0
+    ):
+        raise Stage1ManifestError(
+            "selected_audio_sample_rate must be a positive integer"
+        )
+    import soundfile as sf
+
+    waveform = _load_checkpoint_waveform(checkpoint)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.stem}.",
+        suffix=".wav",
+        dir=str(destination.parent),
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        sf.write(
+            str(temporary),
+            waveform.squeeze(0).numpy(),
+            sample_rate,
+            format="WAV",
+            subtype="FLOAT",
+        )
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        return destination.resolve()
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def attach_attack_outputs(
     source_manifest: str | Path,
     batch_summary: str | Path,
@@ -926,18 +1082,34 @@ def attach_attack_outputs(
     project_root: str | Path = PROJECT_ROOT,
     require_method: str | None = "standard",
     require_full_trajectory: bool = True,
+    selection_policy: str = HISTORY_SELECTION_POLICY,
+    selected_audio_dir: str | Path | None = None,
+    selected_audio_sample_rate: int = DEFAULT_SELECTED_AUDIO_SAMPLE_RATE,
 ) -> pd.DataFrame:
     """Attach only provenance-verified attack and semantic-judge results.
 
-    The selected PGD state comes from ``history.selection.step``.  Its
-    response/success label comes from the offline behavior sidecar, never from
-    ``run.json.attack_success`` (which may be a target-substring heuristic).
+    The history policy preserves the original attack-time selection. The
+    semantic-success-lowest-loss policy instead requires a complete, fully
+    judged trajectory and selects the successful state with the lowest attack
+    loss (earliest step on ties). Semantic labels always come from the offline
+    behavior sidecar, never from run.json.attack_success.
     """
 
     source = Path(source_manifest).expanduser().resolve()
     summary_path = Path(batch_summary).expanduser().resolve()
     labels_path = Path(behavior_labels).expanduser().resolve()
     root = Path(project_root).expanduser().resolve()
+    output_path = Path(output_manifest).expanduser().resolve()
+    if selection_policy not in ATTACK_SELECTION_POLICIES:
+        raise Stage1ManifestError(
+            "selection_policy must be one of: "
+            + ", ".join(ATTACK_SELECTION_POLICIES)
+        )
+    semantic_audio_root = (
+        Path(selected_audio_dir).expanduser().resolve()
+        if selected_audio_dir is not None
+        else output_path.parent / f"{output_path.stem}_selected_audio"
+    )
     frame = read_table(source)
     pair_ids = _validate_pair_ids(frame, name="Source manifest")
     summary = _read_json_object(summary_path, name="batch summary")
@@ -1087,12 +1259,13 @@ def attach_attack_outputs(
         selection = history.get("selection") if isinstance(history, Mapping) else None
         if not isinstance(selection, Mapping):
             raise Stage1ManifestError(f"history selection missing for {pair_id}")
-        selected_step = _integer(
+        history_selected_step = _integer(
             selection.get("step"), name=f"selected attack step for {pair_id}"
         )
-        if selected_step not in checkpoints:
+        if history_selected_step not in checkpoints:
             raise Stage1ManifestError(
-                f"Selected step {selected_step} is absent from {pair_id} trajectory"
+                f"Selected step {history_selected_step} is absent from "
+                f"{pair_id} trajectory"
             )
 
         matching_labels = {
@@ -1100,11 +1273,6 @@ def attach_attack_outputs(
             for step in checkpoints
             if (case_id, pair_id, step) in label_index
         }
-        if selected_step not in matching_labels:
-            row["case_id"] = case_id
-            row[EXCLUSION_REASON_COLUMN] = "missing_selected_behavior_label"
-            exclusion_rows.append(row)
-            continue
         unexpected_steps = sorted(
             step
             for label_case, label_pair, step in label_index
@@ -1134,6 +1302,48 @@ def attach_attack_outputs(
                 f"{fingerprint_mismatch}"
             )
 
+
+        history_losses: dict[int, float] | None = None
+        if selection_policy == SEMANTIC_SELECTION_POLICY:
+            missing_steps = sorted(set(checkpoints) - set(matching_labels))
+            if missing_steps:
+                row["case_id"] = case_id
+                row[EXCLUSION_REASON_COLUMN] = "incomplete_behavior_labels"
+                exclusion_rows.append(row)
+                continue
+            unknown_steps = sorted(
+                step
+                for step, label in matching_labels.items()
+                if label["label_status"] == "unknown"
+            )
+            if unknown_steps:
+                row["case_id"] = case_id
+                row[EXCLUSION_REASON_COLUMN] = "unknown_behavior_labels"
+                exclusion_rows.append(row)
+                continue
+            history_losses = _history_losses(
+                history,
+                pair_id=pair_id,
+                expected_steps=set(checkpoints),
+            )
+            semantic_step = _semantic_selected_step(
+                matching_labels,
+                history_losses,
+            )
+            if semantic_step is None:
+                row["case_id"] = case_id
+                row[EXCLUSION_REASON_COLUMN] = "no_semantic_jailbreak"
+                exclusion_rows.append(row)
+                continue
+            selected_step = semantic_step
+        else:
+            selected_step = history_selected_step
+            if selected_step not in matching_labels:
+                row["case_id"] = case_id
+                row[EXCLUSION_REASON_COLUMN] = "missing_selected_behavior_label"
+                exclusion_rows.append(row)
+                continue
+
         selected_label = matching_labels[selected_step]
         if selected_label["label_status"] == "unknown":
             row["case_id"] = case_id
@@ -1142,15 +1352,36 @@ def attach_attack_outputs(
             continue
 
         jailbreak_success = selected_label["jailbreak_success"]
-        adversarial_audio = _artifact_path(
-            artifacts.get("adversarial_audio"),
-            bases=(case_dir,),
-            name=f"selected adversarial audio for {pair_id}",
-        )
+        if selection_policy == SEMANTIC_SELECTION_POLICY:
+            selected_audio_name = (
+                f"{case_id}_step_{selected_step:06d}_"
+                f"{selected_label['checkpoint_sha256'][:12]}.wav"
+            )
+            adversarial_audio = _atomic_selected_audio(
+                checkpoints[selected_step].path,
+                semantic_audio_root / selected_audio_name,
+                sample_rate=selected_audio_sample_rate,
+            )
+        else:
+            adversarial_audio = _artifact_path(
+                artifacts.get("adversarial_audio"),
+                bases=(case_dir,),
+                name=f"selected adversarial audio for {pair_id}",
+            )
         row.update(
             {
                 "case_id": case_id,
                 "selected_attack_step": selected_step,
+                "history_selected_attack_step": history_selected_step,
+                "attack_selection_policy": selection_policy,
+                "selected_attack_loss": (
+                    None if history_losses is None else history_losses[selected_step]
+                ),
+                "semantic_successful_steps": sum(
+                    label["label_status"] == "ok"
+                    and label["jailbreak_success"] is True
+                    for label in matching_labels.values()
+                ),
                 "experiment_fingerprint": experiment_fingerprint,
                 "selected_checkpoint_path": project_relative_path(
                     checkpoints[selected_step].path, project_root=root
@@ -1173,6 +1404,7 @@ def attach_attack_outputs(
                 "jailbreak_audio_path": project_relative_path(
                     adversarial_audio, project_root=root
                 ),
+                "jailbreak_audio_sha256": sha256_file(adversarial_audio),
                 "jailbreak_response": selected_label["response"],
                 "jailbreak_response_sha256": selected_label["response_sha256"],
                 "jailbreak_success": jailbreak_success,
@@ -1188,7 +1420,7 @@ def attach_attack_outputs(
         source_path=source,
         project_root=root,
     )
-    _atomic_csv(attached, output_manifest)
+    _atomic_csv(attached, output_path)
     exclusions = pd.DataFrame(exclusion_rows)
     exclusion_destination = (
         None if exclusions_path is None else Path(exclusions_path).expanduser().resolve()
@@ -1335,6 +1567,17 @@ def _build_parser() -> argparse.ArgumentParser:
     attach.add_argument("--behavior-labels", type=Path, required=True)
     attach.add_argument("--output", type=Path, required=True)
     attach.add_argument("--exclusions", type=Path)
+    attach.add_argument(
+        "--selection-policy",
+        choices=ATTACK_SELECTION_POLICIES,
+        default=HISTORY_SELECTION_POLICY,
+    )
+    attach.add_argument("--selected-audio-dir", type=Path)
+    attach.add_argument(
+        "--selected-audio-sample-rate",
+        type=int,
+        default=DEFAULT_SELECTED_AUDIO_SAMPLE_RATE,
+    )
 
     clean = commands.add_parser(
         "attach-clean", help="attach verified clean X_B/X_H baseline labels"
@@ -1371,6 +1614,9 @@ def main(argv: list[str] | None = None) -> int:
             args.behavior_labels,
             args.output,
             exclusions_path=args.exclusions,
+            selection_policy=args.selection_policy,
+            selected_audio_dir=args.selected_audio_dir,
+            selected_audio_sample_rate=args.selected_audio_sample_rate,
         )
         print(f"Attached {len(attached)} verified attack row(s) to {args.output}")
     elif args.command == "attach-clean":
