@@ -7,22 +7,37 @@
 
 本目录不包含模型权重、数据集、实验结果、`.env` 或 API 密钥。
 
-## 第一阶段当前进度（2026-08-23）
+## 第一阶段当前进度（7B，2026-10-02）
 
-RQ1 创新点 1 的训练侧流程已经推进到 **57 条 Standard waveform PGD 全轨迹完成**：
+RQ1 创新点 1 的当前正式主线已经迁移到 Qwen2.5-Omni-7B，并完成冻结审计：
 
-- 80 个 probe candidates 的 X_B/X_H clean response 与 Judge 已完成，共 160 条，`unknown=0`；
-- clean 规则保留 57 个 pair，排除 23 个；
-- 57 条正式 Standard PGD 全部完成，`failed=0`，共保存 57 × 101 = 5757 个 checkpoint；
-- 单样本的 `100-step attack → 101-state Judge → semantic attach → finalize` 已完整通过；
-- 单样本证明 attack-time 最低 loss 状态可能仍是拒答，因此训练 X_J 必须从完整 Judge 标签中选择语义成功状态。
+- 训练侧完成 60 × 101 个 Standard PGD 状态的 response/Judge，并从 58 个严格语义成功 triplet 训练了 28 层、3584 维 v2 H/R probes；
+- held-out 20 个 pair 全部完成 Standard PGD、2020 条 response 和 2020 条 canonical-balanced 标签；
+- 20 条轨迹已重放并得到 `[20, 28, 101]` 的 H/R 与 direction 分数，即 56,560 行长表；
+- 双人口分析已经生成：`all=20`、`baseline_refused=17`，t=0 non-refusal/compliance 为 3/3；
+- 7B frozen config 的 18 个阶段全部 `complete`，2026-10-02 深度验证输出 `VALID`。
 
-下一恢复点不是重跑 PGD，而是生成正式 5757 条 checkpoint response，再使用阿里云百炼 `deepseek-v4-flash` Judge。完整结果、产物审计、代码变更和后续顺序见：
+这些结果描述 Layer × Attack-Step 的观察性关联，不构成因果关键层结论。后续 RQ2
+使用独立 AdvBench 数据与干预实验验证因果机制。
 
-- `docs/RQ1创新点1第一阶段交接文档_2026-08-23.md`
-- `docs/RQ1创新点1第一阶段交接文档_2026-08-20.md`（整体实验设计与后续 RQ1 命令）
+当前权威入口与完整审计见：
 
-`run.json.attack_success` 当前是目标字符串启发式，不能作为语义越狱结论。正式训练 X_J 使用 `semantic-success-lowest-loss`；held-out trajectory 为避免成功条件选择偏差，使用 `history`。
+- [RQ1 7B 正式交接文档](docs/RQ1创新点1_7B正式交接文档_2026-10-02.md)
+- [RQ1 统一流水线运行说明](docs/RQ1统一流水线运行说明.md)
+- [RQ1→RQ2 过渡清单](docs/RQ1到RQ2过渡未完成事项清单_2026-10-02.md)
+- [7B 冻结结果清单](configs/stage1_rq1_qwen7b_short_sure_here_is_run01_frozen.json)
+- [配置状态索引](configs/README.md)
+
+以下文件是 3B 历史归档，不是当前恢复入口：
+
+- `configs/stage1_rq1_current_frozen.json`；
+- `configs/stage1_rq1_v2_TEMPLATE.json`；
+- `docs/RQ1创新点1第一阶段交接文档_2026-09-12.md`；
+- `docs/RQ1创新点1当前已完成工作汇总_2026-08-28.md`。
+
+历史手动命令和 36 层、55 个 probe pair、13 个 baseline-refused 等统计仅用于追溯旧 3B
+实验。`run.json.attack_success` 仍只是目标字符串启发式，不能作为语义越狱结论；训练
+X_J 固定使用 `semantic-success-lowest-loss`，held-out 固定使用 `history`，不按攻击成功筛样。
 
 ## 当前研究边界
 
@@ -59,6 +74,11 @@ experiments/
   batch_safety_attack.py        # 可恢复的通用批量攻击入口
   evaluate_stage1_clean.py      # X_B/X_H clean generation 与 Judge
   evaluate_stage1_behavior.py   # trajectory response generation 与 Judge
+  stage1_behavior_contract.py   # stdlib-only 安全行为投影与 v1/v2 契约
+  replay_stage1_trajectories.py # held-out 全轨迹 hidden-state 重放
+  score_stage1_trajectories.py  # Layer×Step H/R 与 direction 评分
+  analyze_stage1_rq1.py         # RQ1 单人口兼容分析与显式双人口分析
+  run_stage1_rq1.py             # 结构化 plan/status/validate/显式阶段执行
   analyze_safety_dynamics.py    # Layer×Step 状态表、瓶颈路径和 Go/No-Go
   activation_patching.py        # 关键层与随机层对照的 activation patching
 evaluation/
@@ -320,9 +340,11 @@ python -m experiments.batch_safety_attack \
 失败 case 写 `error.json`，批次进度写 `summary.json`。这使中断后的重跑不会改变
 后续 case 的逐行 seed。
 
-## Stage1 离线行为评测与 X_J 选择
+## Stage1 离线行为评测与 X_J 选择（历史手动命令）
 
-57 条正式 PGD 已完成，当前下一步是对 5757 个 checkpoint 离线生成 response。response generation 需要本地 Qwen GPU，但不调用 Judge：
+以下命令是旧 3B 实验的历史手动流程，仅保留用于理解和排障，不再是当前 7B 正式结果的“下一步”，也不得用于覆盖任何冻结产物。当前恢复与审计从
+[RQ1 7B 正式交接文档](docs/RQ1创新点1_7B正式交接文档_2026-10-02.md) 和
+[RQ1 统一流水线运行说明](docs/RQ1统一流水线运行说明.md) 进入。以下历史 response generation 使用本地 Qwen GPU，但不调用 Judge：
 
 ```bash
 /root/miniconda3/envs/whisper_default_v2/bin/python \
@@ -370,7 +392,7 @@ set +a
   --fail-fast
 ```
 
-全新 Judge 通常是 `judged=5757, skipped=0`；断点恢复时允许 `judged + skipped = 5757`。只有在最终 sidecar 的 5757 条唯一标签全部存在且 `unknown=0` 后，才能为训练集选择语义成功 X_J：
+全新 Judge 通常是 `judged=5757, skipped=0`；断点恢复时允许 `judged + skipped = 5757`。最终 sidecar 必须具有 5757 条唯一 identity；`unknown` 会被明确记录并排除于语义成功候选，作为 warning 保留，而 identity 缺失、重复或 provenance 错误必须阻断：
 
 ```bash
 /root/miniconda3/envs/whisper_default_v2/bin/python \

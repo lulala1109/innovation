@@ -249,6 +249,12 @@ def _safe_torch_load(path: Path) -> Mapping[str, Any]:
     return payload
 
 
+def safe_torch_load(path: Path) -> Mapping[str, Any]:
+    """Public safe tensor-checkpoint loader shared with Stage-1 replay."""
+
+    return _safe_torch_load(path)
+
+
 def _resolve_local_path(base: Path, value: Any, *, name: str) -> Path:
     if _is_blank(value):
         raise StateCollectionError(f"{name} is required")
@@ -902,6 +908,29 @@ def _pool_forward_states(
     if not result:
         raise StateCollectionError("no hidden-state layers were selected")
     return result
+
+
+def pool_forward_states(
+    model: Any,
+    waveform: Any,
+    *,
+    target_text: str,
+    layers: Optional[Sequence[int]],
+    pooling: str,
+    token_span: str,
+    sequence_has_embedding: bool,
+) -> "OrderedDict[Any, Any]":
+    """Public hidden-state pooling helper shared with Stage-1 replay."""
+
+    return _pool_forward_states(
+        model,
+        waveform,
+        target_text=target_text,
+        layers=layers,
+        pooling=pooling,
+        token_span=token_span,
+        sequence_has_embedding=sequence_has_embedding,
+    )
 
 
 def _default_audio_loader(path: str | Path, *, target_sr: int) -> Any:
@@ -1825,6 +1854,8 @@ __all__ = [
     "build_parser",
     "collect_safety_states",
     "load_trajectory_checkpoints",
+    "pool_forward_states",
+    "safe_torch_load",
     "save_collection_payload",
     "validate_collection_payload",
 ]

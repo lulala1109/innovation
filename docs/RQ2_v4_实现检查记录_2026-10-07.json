@@ -1,0 +1,60 @@
+{
+  "format": "rq2-replication-implementation-verification",
+  "version": 1,
+  "date": "2026-10-07",
+  "config_fingerprint": "b1b11775588aa6d31c815e74a9ccef385937e98c386b7c28f2aecd0d756ce6f9",
+  "checks": {
+    "targeted_unique_cpu_tests_passed": 13,
+    "real_cli_plan": "passed",
+    "real_cli_validate": "passed",
+    "old_v3_archive_artifacts_unchanged": 39,
+    "old_draft_evidence_artifacts_unchanged": 6,
+    "gpu_runs": 0,
+    "paid_api_requests": 0,
+    "new_experiment_output_created": false
+  },
+  "not_verified": [
+    "real_GPU_execution",
+    "live_provider_API_compatibility",
+    "actual_provider_invoice",
+    "external_RQ2_usage_history"
+  ],
+  "source_artifacts": [
+    {
+      "path": "rq2/replication_config.py",
+      "sha256": "4ebf10df15fa1a06df7c3d4f247fee330f95c5e175af80fac0ec90bbb4d04f64"
+    },
+    {
+      "path": "rq2/replication_judge.py",
+      "sha256": "0cf300a521567279d1dee7e9f4c9c6b8b3c7b53933b1cc275de50433fe0e34e7"
+    },
+    {
+      "path": "rq2/replication_pipeline.py",
+      "sha256": "771f7ebe1200ed3b40547c56406b9928f2e85a634e1b27d533963eb4deeb4cec"
+    },
+    {
+      "path": "rq2/replication_progress.py",
+      "sha256": "caa1ed3f6e5380f04bc558945348e543696c482dc7e380066a50efea552cbc36"
+    },
+    {
+      "path": "experiments/rq2_replication.py",
+      "sha256": "821d54c0e090913ac3c0c4d6a2c5614e38fd3af1ac52c4e564e943532316e10a"
+    },
+    {
+      "path": "tests/test_rq2_replication.py",
+      "sha256": "21724bf5269869dd05409836f07aa36ef87163314fe6cad64bc60490b254266f"
+    },
+    {
+      "path": "configs/rq2_qwen7b_advbench_replication_dev_v4_run01_manifest.jsonl",
+      "sha256": "3a34fe4e15ba2c1aa78b439845d21361586563bd723a5b0af690a64092d7b39e"
+    },
+    {
+      "path": "configs/stage2_rq2_qwen7b_advbench_replication_dev_v4_run01.json",
+      "sha256": "801ea4acefa692706f4ad05b2d451251e5da19f58cabae91cf22114e00cb19de"
+    },
+    {
+      "path": "docs/RQ2_v4_独立复验运行协议_2026-10-07.md",
+      "sha256": "a18f7823c6398fef87bfa4f5c4d6b893583702210eb119fa6c2baf4f468d7faa"
+    }
+  ]
+}

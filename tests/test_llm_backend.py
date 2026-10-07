@@ -20,7 +20,11 @@ class _FakeCompletions:
             raise self.owner.request_error
         if self.owner.malformed_response:
             return SimpleNamespace(choices=[])
-        message = SimpleNamespace(content=self.owner.response_content)
+        if self.owner.response_contents:
+            content = self.owner.response_contents.pop(0)
+        else:
+            content = self.owner.response_content
+        message = SimpleNamespace(content=content)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
@@ -33,6 +37,7 @@ class _FakeOpenAI:
         self.init_kwargs = kwargs
         self.create_calls = []
         self.response_content = '{"reasoning":"valid","score":8}'
+        self.response_contents = []
         self.request_error = None
         self.malformed_response = False
         self.chat = SimpleNamespace(
@@ -190,15 +195,31 @@ class LLMBackendTests(unittest.TestCase):
                 else:
                     self.assertEqual(request["extra_body"], extra_body)
 
-    def test_empty_malformed_and_failed_requests_are_fail_fast(self):
+    def test_empty_content_is_retried_until_a_response_is_usable(self):
+        backend = LLMBackend(api_key="private-key", empty_content_retries=2)
+        backend.client.response_contents = ["", "   ", '{"ok":true}']
+
+        result = backend.create_json_completion(
+            [{"role": "user", "content": "Return JSON"}]
+        )
+
+        self.assertEqual(result, '{"ok":true}')
+        self.assertEqual(len(backend.client.create_calls), 3)
+
+    def test_empty_content_fails_after_configured_retries(self):
+        backend = LLMBackend(api_key="private-key", empty_content_retries=2)
+        backend.client.response_contents = [None, "", "   "]
+
+        with self.assertRaisesRegex(LLMBackendError, "after 3 attempt"):
+            backend.create_json_completion(
+                [{"role": "user", "content": "Return JSON"}]
+            )
+
+        self.assertEqual(len(backend.client.create_calls), 3)
+
+    def test_malformed_and_failed_requests_are_fail_fast(self):
         backend = LLMBackend(api_key="private-key")
         messages = [{"role": "user", "content": "Return JSON"}]
-
-        for content in (None, "", "   "):
-            with self.subTest(content=content):
-                backend.client.response_content = content
-                with self.assertRaises(LLMBackendError):
-                    backend.create_json_completion(messages)
 
         backend.client.malformed_response = True
         with self.assertRaises(LLMBackendError):
@@ -220,7 +241,7 @@ class LLMBackendTests(unittest.TestCase):
                 self.assertNotIn("private-key", str(caught.exception))
                 self.assertNotIn("simulated failure", str(caught.exception))
 
-        self.assertEqual(backend.client.init_kwargs["max_retries"], 2)
+        self.assertEqual(backend.client.init_kwargs["max_retries"], 3)
 
     def test_public_config_never_contains_api_key(self):
         backend = LLMBackend(

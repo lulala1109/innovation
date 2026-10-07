@@ -75,6 +75,7 @@ class LLMBackend:
         model_env: str = "JUDGE_LLM_MODEL",
         base_url_env: str = "JUDGE_BASE_URL",
         max_retries: int = 3,
+        empty_content_retries: int = 4,
         timeout: float = 180.0,
     ):
         selected_provider = (
@@ -125,6 +126,12 @@ class LLMBackend:
 
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative.")
+        if (
+            isinstance(empty_content_retries, bool)
+            or not isinstance(empty_content_retries, int)
+            or empty_content_retries < 0
+        ):
+            raise ValueError("empty_content_retries must be a non-negative integer.")
         if timeout <= 0:
             raise ValueError("timeout must be positive.")
 
@@ -132,6 +139,7 @@ class LLMBackend:
         self.model = selected_model
         self.base_url = selected_base_url
         self.max_retries = max_retries
+        self.empty_content_retries = empty_content_retries
         self.timeout = timeout
 
         client_kwargs: Dict[str, Any] = {
@@ -186,33 +194,46 @@ class LLMBackend:
         elif self.provider == "qwen":
             request_kwargs["extra_body"] = {"enable_thinking": False}
 
-        try:
-            response = self.client.chat.completions.create(**request_kwargs)
-        except Exception as exc:
-            error_type = type(exc).__name__
-            log.error(
-                "LLM request failed for provider=%s model=%s (%s)",
-                self.provider,
-                self.model,
-                error_type,
-            )
-            raise LLMBackendError(
-                f"LLM request failed for provider '{self.provider}' and model "
-                f"'{self.model}' after configured retries ({error_type})."
-            ) from None
+        attempts = self.empty_content_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                error_type = type(exc).__name__
+                log.error(
+                    "LLM request failed for provider=%s model=%s (%s)",
+                    self.provider,
+                    self.model,
+                    error_type,
+                )
+                raise LLMBackendError(
+                    f"LLM request failed for provider '{self.provider}' and model "
+                    f"'{self.model}' after configured retries ({error_type})."
+                ) from None
 
-        try:
-            content = response.choices[0].message.content
-        except (AttributeError, IndexError, TypeError):
-            raise LLMBackendError(
-                f"Provider '{self.provider}' returned a malformed completion."
-            ) from None
+            try:
+                content = response.choices[0].message.content
+            except (AttributeError, IndexError, TypeError):
+                raise LLMBackendError(
+                    f"Provider '{self.provider}' returned a malformed completion."
+                ) from None
 
-        if not isinstance(content, str) or not content.strip():
-            raise LLMBackendError(
-                f"Provider '{self.provider}' returned empty completion content."
-            )
-        return content.strip()
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if attempt < attempts:
+                log.warning(
+                    "LLM returned empty content for provider=%s model=%s; "
+                    "retrying (%d/%d)",
+                    self.provider,
+                    self.model,
+                    attempt,
+                    attempts,
+                )
+
+        raise LLMBackendError(
+            f"Provider '{self.provider}' returned empty completion content "
+            f"after {attempts} attempt(s)."
+        )
 
 
 # Descriptive alias for callers that prefer to make compatibility explicit.

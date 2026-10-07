@@ -1,0 +1,191 @@
+{
+  "format": "rq2-v3-conclusion-archive-index",
+  "version": 1,
+  "archive_date": "2026-10-07",
+  "scope": "post_observation_documentation_only",
+  "not_an_executable_config": true,
+  "new_experiment_authorized_by_this_archive": false,
+  "new_run_created": false,
+  "preferred_research_route": "audio_token_original_question",
+  "causal_test_policy": "Keep the frozen 40 causal-test pairs out of development selection and tuning; their behavior results were not read for this archive.",
+  "decision": {
+    "status": "diagnostic_complete",
+    "qualified": false,
+    "scoring_consistency_passed": true,
+    "blocked_reason": "legacy_scoring_contract_not_historically_verified",
+    "allow_downstream_execution": false,
+    "causal_evidence": false
+  },
+  "conditional_pilot_qualified": false,
+  "historical_scoring_contract_verified": false,
+  "independent_event_revalidation": false,
+  "prohibited_next_stages_without_new_protocol_and_authorization": [
+    "mechanism",
+    "window",
+    "protocol_lock",
+    "formal",
+    "subspace"
+  ],
+  "hash_algorithm": "sha256",
+  "path_base": "repository_root",
+  "index_note": "Snapshot of selected original and derived evidence, not a complete repository backup or a retrospective preregistration. Original and derived results remain distinct. The archive document is bound by hash; this index does not hash itself.",
+  "source_artifact_count": 39,
+  "source_artifacts": [
+    {
+      "path": "docs/RQ2_v3_结论归档与后续方案选择_2026-10-07.md",
+      "sha256": "fa85845f4e23e07a82e0cee7bf1cf28e3e5adaf1b71acdc32ad33f16039a3e73"
+    },
+    {
+      "path": "docs/RQ2_7B_v3_事件中心_dev协议_2026-10-06.md",
+      "sha256": "d44b31359611c4b913ef513afcb49265ff3a05bef383567c93353f0f3b2f0d3f"
+    },
+    {
+      "path": "docs/RQ2_v3_Judge评分修订协议_2026-10-07.md",
+      "sha256": "1937fe77804652e340e9a549ea87b6e42cf6c6ec84965e59fb1f0175d3820196"
+    },
+    {
+      "path": "docs/RQ2_v3_离线诊断与可达性门禁_2026-10-07.md",
+      "sha256": "261f50791487b2071fb0b75cff71b037e3b3b2e1f465bd106f20080309fd993d"
+    },
+    {
+      "path": "configs/stage2_rq2_qwen7b_advbench_event_dev_v3_run01.json",
+      "sha256": "6ad320eeaf24632f3ab2eca67ff215a7201741464247c0158094d704b109ef91"
+    },
+    {
+      "path": "configs/rq2_event_preregistration_qwen7b_advbench_event_dev_v3_run01.json",
+      "sha256": "54b881606c06255e2ca6f41052c6f4cc725a6eb1cadcac7a12040ae183ab6c01"
+    },
+    {
+      "path": "configs/rq2_qwen7b_advbench_event_dev_v3_run01_judge_revision01.json",
+      "sha256": "397ce5ce37e5d6e19f0b8f2a71bdd363f7de7e98f17cded0ac1abc387954a6ea"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/pipeline_state.json",
+      "sha256": "3319fc7ca37750762a9443e9761be0fdfda2b6b37584df9d1553f8f586b9ed2b"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/provenance/layer_map.json",
+      "sha256": "bfbe65e19e0217fd13d27f04c36970840efed6c98e263439d5d5f57eaef53e6e"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/oracle_pilot/analysis.json",
+      "sha256": "14e1a2c89fa46883364fcad3746f7cbff92455c7b497bfdf1702eaa2d451c52c"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/oracle_pilot/trials.jsonl",
+      "sha256": "8f8053a384ea747c4bd784825d8084653a116930608ed20691c7c2a0fdf8edb1"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/oracle_pilot/responses.jsonl",
+      "sha256": "01ef26b4fe07d841dedab4652bfa75a96e249271c7b197c167202d822bc5f3f6"
+    },
+    {
+      "path": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01/oracle_pilot/labels.jsonl",
+      "sha256": "74cc16cfbf4968b3306785e1840d535cfc29dcdd08616d4d949f1b05e6b5ceb9"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/result.json",
+      "sha256": "a023eb649d5be9c16e3d4851c720c8248e01608ce835746d40b9cde0fe112a7c"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/input_binding.json",
+      "sha256": "72fadf6c241e8e2623cd6205f10f33016753427824fe0e09cad3360194820a87"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/rq2_summary.json",
+      "sha256": "310699868365ee06204f1385d766305e88917c53c3c30bdd9f52b736af2d6db3"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/labels.jsonl",
+      "sha256": "2e54e97d84b36ff154cee5f76a0a92b4d444fe12756762cc10dc2242e51584fe"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/bindings.jsonl",
+      "sha256": "34ca4d00bcebfaaf0fc3608987eef3a77c612ea96a7a658c866c8f5e6148b76d"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/analysis/scoring_consistency_audit.json",
+      "sha256": "d8ada0f4b07b9d3d2e5d0963b194f97334968a57683b55933b7fec8d14c2c465"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/event_definition_audit.json",
+      "sha256": "c5c410d3dca0b5b3011e2fca3bad64100f980038c6a957381036b4a299746f4c"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/provenance.json",
+      "sha256": "9866324d4d05ef1f0751db7482ab9234ea18683cf62dfa74c1dc31c526162d2d"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/offline/summary.json",
+      "sha256": "b182933048c44c08cf4ea6d80116792bb25b7ca341997d9c8f436638e817f1f6"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/report.md",
+      "sha256": "2388ce0f15a62e7949b0abba0cd118d87e77028df188e53b3cf86d7389023b88"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/summary.json",
+      "sha256": "17931147a82fbdd89795e0c339b9a79dee2cdbd9e1da1e54ecfc0db344b6d62e"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/reachability.json",
+      "sha256": "ecc1b070e6465e5a5c304ceab022470994181b1d0b207516f6d8dccd4616fcc1"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/all_interventions.csv",
+      "sha256": "b0895b17c057c6f5ff3274b04db518959267090a92010e6a9edbb3b0dd821fa1"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/full_state_by_pair.csv",
+      "sha256": "c3cd913497543ba9c2339fc2c64d8fcf45a2d876ea18d089513b1a7865e1604e"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/layer24_all_pairs.csv",
+      "sha256": "9474661d9256e22397b1942c0a3432bfb7f408581a3b00518c461a2667aa4f6a"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/layer24_nonpositive.csv",
+      "sha256": "72d4d98c62d655e0c44e0f2a48638764caee1c8cdc5a7fcdcb98144f6e480a9d"
+    },
+    {
+      "path": "outputs/stage2_rq2/diagnostics/qwen7b_advbench_event_dev_v3_run01_diagnostic01/provenance.json",
+      "sha256": "8708142b0c014584e9db387d66558e3f4fc1afa7a1eb7011b847b4835187dcc3"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/0b10e850ea618629ab3e3b3c21a5eb9858b738c00b9e90530e94b9b10882a2d6.json",
+      "sha256": "c11de2c32208f9320b4b5963d44d4cfe1fd123c215eb6d649de70a20f33d333b"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/13deb3dffe1327805ea93bab5ed0ec332f32000f45699e2c10ae00a102d49071.json",
+      "sha256": "ae4b47d4ac7e7d028ee294ebf218e0788a515930210c97823314f96f364bfd24"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/19a88564ad86cd41dc382ceea680b6be8e7c1761e5dd11789b9707b5bbe6d648.json",
+      "sha256": "0d1700cb7a923b7d2af28286f924525346d5d30734c3c97119b908850b561a12"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/4b850ae8e392f955cd724983c6c87fa834c1b78fd5c65b8421149c1446d9f890.json",
+      "sha256": "9794586965aa1076a73204409013ed1d337b1ffa9077b8dda040e90b72c4d2e5"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/59bd4a8ac747412dc6963afc1c79f487a88c199ddd903db067bc29ef267d4b07.json",
+      "sha256": "91d0bd023642ec959abdf5aad6aec66784cf3f736db550d8a2e24fbd01ecf19d"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/6bc5f615176849fa2089fde18bf7b19f388bd6d7a0a3c33b22f2eebf4f80afd1.json",
+      "sha256": "a30b6ce5b3be18da0915687a69cd8a88125b130e26a347f5e49cd714a7fc4744"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/9102280a4b24a94d9579c981b44f48a58a2c046d2a259091919a811a169c71df.json",
+      "sha256": "5eb6823ad4fdb61a5d2c868851d1237f6a4c12fcac1f476448753c23bd13b69f"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/cbb344787fea52e2f3d4a466712e5269b8ff3466828dc78853ef972086e08dcb.json",
+      "sha256": "d1ca17b1ecd26adc4d63c49de97f0dec888823539778035e5a54591cc7735e5c"
+    },
+    {
+      "path": "outputs/stage2_rq2/judge_revision/qwen7b_advbench_event_dev_v3_run01_judge_revision01/review/ee160ae53d98c6dfb9f756f060964a0272c82ad804c20b68d86a1fe3dfd700a0.json",
+      "sha256": "28bd2676f0d0bd2f0c314bd5c8b2f996e459ac98d74a1563c8096cd1c3b84c3e"
+    }
+  ]
+}

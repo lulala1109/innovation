@@ -299,6 +299,27 @@ class Stage1TrajectoryScoringTests(unittest.TestCase):
             self.assertAlmostEqual(payload["scores"]["H_direction"][0, 0, 3].item(), 3.0)
             self.assertNotAlmostEqual(payload["scores"]["H_probe"][0, 0, 3].item(), 3.0)
             self.assertEqual(payload["behavior"][0][1]["label_status"], "unknown")
+            self.assertEqual(payload["version"], 2)
+            self.assertEqual(payload["metadata"]["source_replay_version"], 1)
+            self.assertEqual(
+                payload["metadata"]["continuous_behavior_status"], "unavailable"
+            )
+            from experiments.stage1_behavior_contract import (
+                BEHAVIOR_FIELDS,
+                CONTINUOUS_BEHAVIOR_FIELDS,
+                SENSITIVE_BEHAVIOR_FIELDS,
+            )
+
+            self.assertTrue(
+                all(
+                    tuple(row) == BEHAVIOR_FIELDS
+                    and not SENSITIVE_BEHAVIOR_FIELDS.intersection(row)
+                    and row["continuous_behavior_status"] == "unavailable"
+                    and all(row[field] is None for field in CONTINUOUS_BEHAVIOR_FIELDS)
+                    for case in payload["behavior"]
+                    for row in case
+                )
+            )
             self.assertTrue(payload["metadata"]["probe_model_fingerprint_verified"])
             self.assertEqual(payload["metadata"]["probe_training_num_pairs"], 2)
             self.assertTrue((output / "state_scores.pt").is_file())
@@ -321,6 +342,10 @@ class Stage1TrajectoryScoringTests(unittest.TestCase):
             )
             self.assertEqual(unknown["label_status"], "unknown")
             self.assertEqual(unknown["refusal_label"], "")
+            self.assertNotIn(
+                "response-0-0",
+                (output / "state_scores_long.csv").read_text(encoding="utf-8"),
+            )
 
     def test_v1_requires_both_explicit_compatibility_switches(self):
         with tempfile.TemporaryDirectory() as directory:

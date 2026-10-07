@@ -321,6 +321,40 @@ class QwenModel(BaseAudioModel):
         selected = resolve_layer_indices(len(available), tuple(layers))
         return OrderedDict((index, available[index]) for index in selected)
 
+    def get_final_decoder_norm_module(self) -> torch.nn.Module:
+        """Return the norm producing the final RQ1 ``hidden_states`` entry.
+
+        RQ1 collects ``hidden_states[layer + 1]``. For the final decoder
+        layer, Transformers stores the output after this norm, whereas a
+        decoder-block output hook sees the tensor before it.
+        """
+
+        decoder_layers = tuple(self.transformer_layer_modules.values())
+        for path in (
+            "model",
+            "model.language_model",
+            "model.language_model.model",
+            "language_model",
+            "language_model.model",
+            "model.model",
+        ):
+            owner = self._resolve_module_path(self.thinker, path)
+            if owner is None:
+                continue
+            layers = getattr(owner, "layers", None)
+            norm = getattr(owner, "norm", None)
+            if not isinstance(norm, torch.nn.Module):
+                continue
+            try:
+                matched = tuple(layers)
+            except TypeError:
+                continue
+            if len(matched) == len(decoder_layers) and all(
+                found is expected for found, expected in zip(matched, decoder_layers)
+            ):
+                return norm
+        raise RuntimeError("Could not locate the final norm of the Thinker text decoder")
+
     def wav_to_mel_exact(
         self,
         wav: torch.Tensor

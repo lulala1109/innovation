@@ -96,7 +96,7 @@ class Stage1RQ1ReportingTests(unittest.TestCase):
         analysis["axes"]["case_ids"] = [f"case-{index}" for index in range(20)]
         analysis["metadata"] = {
             "source_metadata": {
-                "probe_training_num_pairs": 80,
+                "probe_training_num_pairs": 55,
                 "probe_training_stage1_provenance_verified": True,
                 "probe_training_measurement_split": "measurement_train",
                 "probe_training_stage1_role": "probe_candidate",
@@ -116,9 +116,46 @@ class Stage1RQ1ReportingTests(unittest.TestCase):
                 analysis, directory, make_plots=False
             )
             text = Path(output["report"]).read_text(encoding="utf-8")
-        self.assertIn("80 probe-training pairs / 20 held-out", text)
-        self.assertIn("matches the planned 80/20 split", text)
+        self.assertIn(
+            "55 post-selection probe-training pairs / 20 held-out", text
+        )
+        self.assertIn("split/role provenance checks passed", text)
+        self.assertIn("distinct quantities", text)
+        self.assertNotIn("does not match", text)
         self.assertIn("not reported (full model did not converge)", text)
+
+    def test_dual_population_report_discloses_eligibility_without_primary(self):
+        analysis = self._analysis()
+        analysis["metadata"] = {
+            "source_metadata": {
+                "analysis_population": "baseline_refused",
+                "population_policy": "symmetric-no-primary-population",
+                "primary_population": None,
+                "source_score_version": 1,
+                "population_audit_counts": {
+                    "all": 20,
+                    "baseline_refused": 13,
+                    "t0_unknown": 0,
+                    "t0_missing": 0,
+                    "t0_non_refusal": 7,
+                    "t0_compliance": 6,
+                },
+            }
+        }
+        analysis["behavior_trajectory"] = [
+            {"continuous_behavior_status": "unavailable"}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = generate_stage1_rq1_report(
+                analysis, directory, make_plots=False
+            )
+            text = Path(output["report"]).read_text(encoding="utf-8")
+        self.assertIn("Baseline eligibility disclosure", text)
+        self.assertIn("baseline-refused eligible: 13", text)
+        self.assertIn("non-refusal=7", text)
+        self.assertIn("compliance=6", text)
+        self.assertIn("neither is designated as the primary", text)
+        self.assertIn("never inferred or fabricated", text)
 
     def test_requested_plots_raise_clear_optional_dependency_error(self):
         module = importlib.import_module("reporting.generate_stage1_rq1_report")

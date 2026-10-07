@@ -23,13 +23,25 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from experiments.stage1_behavior_contract import (
+    BEHAVIOR_FIELDS,
+    BEHAVIOR_SCHEMA_VERSION,
+    CONTINUOUS_BEHAVIOR_FIELDS,
+    BehaviorContractError,
+    normalize_replay_behavior,
+    validate_behavior_contract,
+    validate_projected_behavior,
+)
+
 
 REPLAY_INDEX_FORMAT = "stage1-trajectory-hidden-state-index"
 REPLAY_CASE_FORMAT = "stage1-trajectory-hidden-states"
-REPLAY_VERSION = 1
+REPLAY_VERSION = 2
+SUPPORTED_REPLAY_VERSIONS = frozenset((1, REPLAY_VERSION))
 PROBE_FORMAT = "dual-safety-state-layerwise-linear-probes"
 SCORE_FORMAT = "stage1-trajectory-scores"
-SCORE_VERSION = 1
+SCORE_VERSION = 2
+SUPPORTED_SCORE_VERSIONS = frozenset((1, SCORE_VERSION))
 PHASE_THRESHOLDS = {
     "early": [0.0, 1.0 / 3.0],
     "middle": [1.0 / 3.0, 2.0 / 3.0],
@@ -61,15 +73,40 @@ LONG_FIELDS = (
     "delta_R_direction",
     "label_status",
     "generation_status",
+    "behavior_label",
     "refusal_label",
     "compliance_label",
     "jailbreak_success",
+    "refusal_score",
+    "strongreject_score",
+    "convincingness",
+    "specificity",
+    "continuous_behavior_status",
     "response_sha256",
     "checkpoint_sha256",
     "experiment_fingerprint",
     "model_fingerprint",
     "replay_fingerprint",
     "probe_checkpoint_sha256",
+)
+SAFE_ROW_METADATA_FIELDS = (
+    "case_id",
+    "pair_id",
+    "step",
+    "total_steps",
+    "progress",
+    "phase",
+    "attack_loss",
+    "checkpoint_path",
+    "checkpoint_sha256",
+    "experiment_fingerprint",
+    "generation_status",
+    "label_status",
+    "response_sha256",
+    "forward_target_source",
+    "delta_linf",
+    "delta_rms",
+    "snr_db",
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -247,8 +284,37 @@ def _validate_case(
     except Stage1TrajectoryReplayError as exc:
         raise Stage1ScoringError(f"{path}: invalid replay payload: {exc}") from exc
 
-    if payload.get("format") != REPLAY_CASE_FORMAT or payload.get("version") != REPLAY_VERSION:
-        raise Stage1ScoringError(f"{path}: unsupported replay case format/version")
+    replay_version = payload.get("version")
+    index_version = index.get("version")
+    if (
+        payload.get("format") != REPLAY_CASE_FORMAT
+        or isinstance(replay_version, bool)
+        or replay_version not in SUPPORTED_REPLAY_VERSIONS
+        or replay_version != index_version
+    ):
+        raise Stage1ScoringError(f"{path}: unsupported or mixed replay version")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise Stage1ScoringError(f"{path}: metadata must be a mapping")
+
+    projected_contract: Optional[dict[str, Any]] = None
+    scoring_protocol: Optional[Mapping[str, Any]] = None
+    if replay_version == REPLAY_VERSION:
+        try:
+            projected_contract = validate_behavior_contract(
+                metadata.get("behavior_contract")
+            )
+            index_contract = validate_behavior_contract(index.get("behavior_contract"))
+        except BehaviorContractError as exc:
+            raise Stage1ScoringError(
+                f"{path}: invalid replay behavior contract: {exc}"
+            ) from exc
+        if projected_contract != index_contract:
+            raise Stage1ScoringError(
+                f"{path}: replay behavior contract disagrees with index"
+            )
+        scoring_protocol = projected_contract["scoring_protocol"]
+
     case_id = _required_text(payload.get("case_id"), name=f"{path}: case_id")
     pair_id = _required_text(payload.get("pair_id"), name=f"{path}: pair_id")
     if case_id != _required_text(descriptor.get("case_id"), name="index case_id"):
@@ -259,7 +325,7 @@ def _validate_case(
     steps = _as_steps(payload.get("steps"), name=f"{path}: steps")
     count = int(steps.numel())
     total_steps = _integer(
-        payload.get("metadata", {}).get("total_steps"),
+        metadata.get("total_steps"),
         name=f"{path}: metadata.total_steps",
     )
     expected = torch.arange(total_steps + 1, dtype=torch.int64)
@@ -327,12 +393,21 @@ def _validate_case(
         metadata_row = row_metadata[position]
         if not isinstance(behavior_row, Mapping) or not isinstance(metadata_row, Mapping):
             raise Stage1ScoringError(f"{path}: behavior/row_metadata entries must map")
+        try:
+            safe_behavior = normalize_replay_behavior(
+                behavior_row,
+                replay_version=int(replay_version),
+                scoring_protocol=scoring_protocol,
+                source=f"{path}: behavior[{step}]",
+            )
+        except BehaviorContractError as exc:
+            raise Stage1ScoringError(f"{path}: invalid behavior at step {step}: {exc}") from exc
         for field, expected_value in (
             ("case_id", case_id), ("pair_id", pair_id), ("step", step)
         ):
             if metadata_row.get(field) != expected_value:
                 raise Stage1ScoringError(f"{path}: row_metadata[{step}].{field} disagrees")
-            if behavior_row.get(field) != expected_value:
+            if safe_behavior.get(field) != expected_value:
                 raise Stage1ScoringError(f"{path}: behavior[{step}].{field} disagrees")
         if metadata_row.get("total_steps") != total_steps:
             raise Stage1ScoringError(f"{path}: total_steps mismatch at step {step}")
@@ -357,34 +432,28 @@ def _validate_case(
         )
         if row_fingerprint != fingerprint:
             raise Stage1ScoringError(f"{path}: fingerprint mismatch at step {step}")
-        response = behavior_row.get("response")
-        if not isinstance(response, str):
-            raise Stage1ScoringError(f"{path}: behavior response must be text at step {step}")
-        response_digest = behavior_row.get("response_sha256")
-        if response_digest is None:
-            if response:
-                raise Stage1ScoringError(
-                    f"{path}: non-empty response lacks SHA-256 at step {step}"
-                )
-        else:
-            response_digest = _required_sha256(
-                response_digest, name=f"{path}: behavior[{step}].response_sha256"
-            )
-            if response_digest != hashlib.sha256(response.encode("utf-8")).hexdigest():
-                raise Stage1ScoringError(
-                    f"{path}: response SHA-256 mismatch at step {step}"
-                )
+        response_digest = safe_behavior.get("response_sha256")
         if metadata_row.get("response_sha256") != response_digest:
             raise Stage1ScoringError(
                 f"{path}: response provenance mismatch at step {step}"
             )
-        row_loss = float(metadata_row.get("attack_loss"))
+        for field in ("generation_status", "label_status"):
+            if metadata_row.get(field) != safe_behavior.get(field):
+                raise Stage1ScoringError(
+                    f"{path}: behavior provenance mismatch for {field} at step {step}"
+                )
+        try:
+            row_loss = float(metadata_row.get("attack_loss"))
+        except (TypeError, ValueError) as exc:
+            raise Stage1ScoringError(f"{path}: invalid attack_loss at step {step}") from exc
         if not math.isfinite(row_loss) or not math.isclose(
             row_loss, float(attack_loss[position]), rel_tol=1e-6, abs_tol=1e-7
         ):
             raise Stage1ScoringError(f"{path}: attack_loss mismatch at step {step}")
-        normalized_behavior.append(dict(behavior_row))
-        normalized_rows.append(dict(metadata_row))
+        normalized_behavior.append(safe_behavior)
+        normalized_rows.append(
+            {field: metadata_row.get(field) for field in SAFE_ROW_METADATA_FIELDS}
+        )
 
     model_fingerprint = _case_model_fingerprint(payload)
     if model_fingerprint != _required_sha256(
@@ -392,7 +461,7 @@ def _validate_case(
     ):
         raise Stage1ScoringError(f"{path}: model_fingerprint disagrees with index")
     replay_fingerprint = _required_sha256(
-        payload.get("metadata", {}).get("replay_fingerprint"),
+        metadata.get("replay_fingerprint"),
         name=f"{path}: metadata.replay_fingerprint",
     )
     if replay_fingerprint != _required_sha256(
@@ -400,6 +469,7 @@ def _validate_case(
     ):
         raise Stage1ScoringError(f"{path}: replay_fingerprint disagrees with index")
     return {
+        "version": int(replay_version),
         "case_id": case_id,
         "pair_id": pair_id,
         "steps": steps,
@@ -413,7 +483,8 @@ def _validate_case(
         "experiment_fingerprint": fingerprint,
         "model_fingerprint": model_fingerprint,
         "replay_fingerprint": replay_fingerprint,
-        "metadata": dict(payload["metadata"]),
+        "behavior_contract": projected_contract,
+        "metadata": dict(metadata),
         "path": path,
     }
 
@@ -423,10 +494,27 @@ def load_replay_artifact(value: str | Path) -> Mapping[str, Any]:
 
     index_path = _resolve_replay_index(value)
     index = _read_json(index_path)
-    if index.get("format") != REPLAY_INDEX_FORMAT or index.get("version") != REPLAY_VERSION:
+    index_version = index.get("version")
+    if (
+        index.get("format") != REPLAY_INDEX_FORMAT
+        or isinstance(index_version, bool)
+        or index_version not in SUPPORTED_REPLAY_VERSIONS
+    ):
         raise Stage1ScoringError("unsupported replay index format/version")
     if index.get("complete") is not True:
         raise Stage1ScoringError("replay index is incomplete")
+    projected_contract: Optional[dict[str, Any]] = None
+    if index_version == REPLAY_VERSION:
+        try:
+            projected_contract = validate_behavior_contract(
+                index.get("behavior_contract")
+            )
+        except BehaviorContractError as exc:
+            raise Stage1ScoringError(f"invalid replay index behavior contract: {exc}") from exc
+        if index.get("continuous_behavior_status") != "available":
+            raise Stage1ScoringError(
+                "v2 replay index continuous_behavior_status must be 'available'"
+            )
     _required_sha256(index.get("model_fingerprint"), name="index.model_fingerprint")
     replay_fingerprint = _required_sha256(
         index.get("replay_fingerprint"), name="index.replay_fingerprint"
@@ -434,6 +522,12 @@ def load_replay_artifact(value: str | Path) -> Mapping[str, Any]:
     replay_config = index.get("config")
     if not isinstance(replay_config, Mapping):
         raise Stage1ScoringError("index.config must be a mapping")
+    if index_version == REPLAY_VERSION:
+        assert projected_contract is not None
+        if replay_config.get("behavior_contract") != projected_contract:
+            raise Stage1ScoringError(
+                "replay config/index behavior contract mismatch"
+            )
     canonical_replay_digest = hashlib.sha256(
         json.dumps(
             replay_config,
@@ -538,13 +632,24 @@ def load_replay_artifact(value: str | Path) -> Mapping[str, Any]:
         for layer, reference_layer in zip(case["layers"], reference["layers"]):
             if case["hidden_states"][layer].shape[1] != reference["hidden_states"][reference_layer].shape[1]:
                 raise Stage1ScoringError("hidden size changes across replay cases")
-        for field in ("model_fingerprint", "replay_fingerprint"):
+        for field in (
+            "version",
+            "model_fingerprint",
+            "replay_fingerprint",
+            "behavior_contract",
+        ):
             if case[field] != reference[field]:
                 raise Stage1ScoringError(f"all replay cases must share {field}")
         for field in ("pooling", "token_span", "sequence_has_embedding"):
             if case["metadata"].get(field) != reference["metadata"].get(field):
                 raise Stage1ScoringError(f"all replay cases must share {field}")
-    return {"index_path": index_path, "index": index, "cases": cases}
+    return {
+        "version": int(index_version),
+        "behavior_contract": projected_contract,
+        "index_path": index_path,
+        "index": index,
+        "cases": cases,
+    }
 
 
 def _probe_source_provenance(
@@ -805,12 +910,22 @@ def _atomic_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
 
 
 def validate_score_payload(payload: Mapping[str, Any]) -> tuple[int, int, int]:
-    """Validate the public ``[N,L,S]`` score payload contract."""
+    """Validate the public ``[N,L,S]`` score payload contract (v1/v2)."""
 
     import torch
 
-    if payload.get("format") != SCORE_FORMAT or payload.get("version") != SCORE_VERSION:
+    if not isinstance(payload, Mapping):
+        raise Stage1ScoringError("score payload must be a mapping")
+    version = payload.get("version")
+    if (
+        payload.get("format") != SCORE_FORMAT
+        or isinstance(version, bool)
+        or version not in SUPPORTED_SCORE_VERSIONS
+    ):
         raise Stage1ScoringError("unsupported score payload format/version")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise Stage1ScoringError("score metadata must be a mapping")
     case_ids = payload.get("case_ids")
     pair_ids = payload.get("pair_ids")
     layers = payload.get("layers")
@@ -830,10 +945,10 @@ def validate_score_payload(payload: Mapping[str, Any]) -> tuple[int, int, int]:
     scores = payload.get("scores")
     deltas = payload.get("deltas")
     if not isinstance(scores, Mapping) or tuple(scores) != SCORE_KEYS:
-        raise Stage1ScoringError("scores keys/order do not match the v1 contract")
+        raise Stage1ScoringError("scores keys/order do not match the score contract")
     if not isinstance(deltas, Mapping) or tuple(deltas) != DELTA_KEYS:
-        raise Stage1ScoringError("deltas keys/order do not match the v1 contract")
-    allow_nan = bool(payload.get("metadata", {}).get("directions_missing"))
+        raise Stage1ScoringError("deltas keys/order do not match the score contract")
+    allow_nan = bool(metadata.get("directions_missing"))
     for name, tensor in (*scores.items(), *deltas.items()):
         if not isinstance(tensor, torch.Tensor) or tensor.shape != (n, ell, s):
             raise Stage1ScoringError(f"{name} must have shape [{n},{ell},{s}]")
@@ -843,13 +958,103 @@ def validate_score_payload(payload: Mapping[str, Any]) -> tuple[int, int, int]:
             if not bool(torch.isfinite(tensor).all()):
                 raise Stage1ScoringError(f"{name} contains non-finite values")
     attack_loss = payload.get("attack_loss")
-    if not isinstance(attack_loss, torch.Tensor) or attack_loss.shape != (n, s):
-        raise Stage1ScoringError(f"attack_loss must have shape [{n},{s}]")
+    if (
+        not isinstance(attack_loss, torch.Tensor)
+        or attack_loss.shape != (n, s)
+        or not attack_loss.is_floating_point()
+        or attack_loss.is_complex()
+        or not bool(torch.isfinite(attack_loss).all())
+    ):
+        raise Stage1ScoringError(f"attack_loss must be finite floating [{n},{s}]")
     behavior = payload.get("behavior")
     if not isinstance(behavior, list) or len(behavior) != n or any(
         not isinstance(rows, list) or len(rows) != s for rows in behavior
     ):
         raise Stage1ScoringError("behavior must have the [N][S] grid")
+
+    if version == SCORE_VERSION:
+        behavior_schema_version = metadata.get("behavior_schema_version")
+        if behavior_schema_version != BEHAVIOR_SCHEMA_VERSION:
+            raise Stage1ScoringError(
+                f"score behavior_schema_version must be {BEHAVIOR_SCHEMA_VERSION}"
+            )
+        if metadata.get("behavior_fields") != list(BEHAVIOR_FIELDS):
+            raise Stage1ScoringError("score metadata behavior_fields changed")
+        source_replay_version = metadata.get("source_replay_version")
+        if (
+            isinstance(source_replay_version, bool)
+            or source_replay_version not in SUPPORTED_REPLAY_VERSIONS
+        ):
+            raise Stage1ScoringError("score source_replay_version is invalid")
+        scoring_protocol: Optional[Mapping[str, Any]] = None
+        allow_continuous_unavailable = source_replay_version == 1
+        expected_global_status = (
+            "unavailable" if allow_continuous_unavailable else "available"
+        )
+        if metadata.get("continuous_behavior_status") != expected_global_status:
+            raise Stage1ScoringError(
+                "score metadata continuous_behavior_status disagrees with source replay"
+            )
+        if source_replay_version == REPLAY_VERSION:
+            try:
+                contract = validate_behavior_contract(metadata.get("behavior_contract"))
+            except BehaviorContractError as exc:
+                raise Stage1ScoringError(
+                    f"invalid score behavior contract: {exc}"
+                ) from exc
+            scoring_protocol = contract["scoring_protocol"]
+        elif metadata.get("behavior_contract") is not None:
+            raise Stage1ScoringError(
+                "legacy replay scores must mark behavior_contract unavailable"
+            )
+
+        for case_index, rows in enumerate(behavior):
+            for step_index, row in enumerate(rows):
+                try:
+                    normalized = validate_projected_behavior(
+                        row,
+                        scoring_protocol=scoring_protocol,
+                        allow_continuous_unavailable=allow_continuous_unavailable,
+                        source=f"behavior[{case_index}][{step_index}]",
+                    )
+                except BehaviorContractError as exc:
+                    raise Stage1ScoringError(str(exc)) from exc
+                if (
+                    normalized["case_id"] != case_ids[case_index]
+                    or normalized["pair_id"] != pair_ids[case_index]
+                    or normalized["step"] != step_index
+                ):
+                    raise Stage1ScoringError(
+                        f"behavior[{case_index}][{step_index}] identity mismatch"
+                    )
+                if allow_continuous_unavailable and any(
+                    normalized[field] is not None
+                    for field in CONTINUOUS_BEHAVIOR_FIELDS
+                ):
+                    raise Stage1ScoringError(
+                        "legacy replay continuous behavior must remain unavailable"
+                    )
+
+        row_metadata = payload.get("row_metadata")
+        if not isinstance(row_metadata, list) or len(row_metadata) != n or any(
+            not isinstance(rows, list) or len(rows) != s for rows in row_metadata
+        ):
+            raise Stage1ScoringError("row_metadata must have the [N][S] grid")
+        expected_row_fields = set(SAFE_ROW_METADATA_FIELDS)
+        for case_index, rows in enumerate(row_metadata):
+            for step_index, row in enumerate(rows):
+                if not isinstance(row, Mapping) or set(row) != expected_row_fields:
+                    raise Stage1ScoringError(
+                        f"row_metadata[{case_index}][{step_index}] fields changed"
+                    )
+                if (
+                    row.get("case_id") != case_ids[case_index]
+                    or row.get("pair_id") != pair_ids[case_index]
+                    or row.get("step") != step_index
+                ):
+                    raise Stage1ScoringError(
+                        f"row_metadata[{case_index}][{step_index}] identity mismatch"
+                    )
     return n, ell, s
 
 
@@ -911,8 +1116,18 @@ def score_stage1_trajectories(
     for score_name, delta_name in zip(SCORE_KEYS, DELTA_KEYS):
         values = score_storage[score_name]
         delta_storage[delta_name] = values - values[:, :, :1]
+    source_replay_version = int(replay["version"])
     metadata = {
         "replay_index": str(replay["index_path"]),
+        "source_replay_version": source_replay_version,
+        "behavior_schema_version": BEHAVIOR_SCHEMA_VERSION,
+        "behavior_fields": list(BEHAVIOR_FIELDS),
+        "behavior_contract": replay["behavior_contract"],
+        "continuous_behavior_status": (
+            "available"
+            if source_replay_version == REPLAY_VERSION
+            else "unavailable"
+        ),
         "replay_index_sha256": sha256_file(replay["index_path"]),
         "replay_fingerprint": cases[0]["replay_fingerprint"],
         "model_fingerprint": cases[0]["model_fingerprint"],
@@ -992,9 +1207,17 @@ def score_stage1_trajectories(
                     "attack_loss": float(attack_loss[case_index, step_index]),
                     "label_status": _behavior_value(behavior, row_meta, "label_status"),
                     "generation_status": _behavior_value(behavior, row_meta, "generation_status"),
+                    "behavior_label": _behavior_value(behavior, row_meta, "behavior_label"),
                     "refusal_label": _behavior_value(behavior, row_meta, "refusal_label", "refusal"),
                     "compliance_label": _behavior_value(behavior, row_meta, "compliance_label", "compliance"),
                     "jailbreak_success": _behavior_value(behavior, row_meta, "jailbreak_success"),
+                    "refusal_score": _behavior_value(behavior, row_meta, "refusal_score"),
+                    "strongreject_score": _behavior_value(behavior, row_meta, "strongreject_score"),
+                    "convincingness": _behavior_value(behavior, row_meta, "convincingness"),
+                    "specificity": _behavior_value(behavior, row_meta, "specificity"),
+                    "continuous_behavior_status": _behavior_value(
+                        behavior, row_meta, "continuous_behavior_status"
+                    ),
                     "response_sha256": _behavior_value(behavior, row_meta, "response_sha256"),
                     "checkpoint_sha256": case["checkpoint_sha256"][step_index],
                     "experiment_fingerprint": case["experiment_fingerprint"],

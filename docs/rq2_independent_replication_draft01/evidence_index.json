@@ -1,0 +1,34 @@
+{
+  "format": "rq2-replication-draft-evidence-index",
+  "version": 1,
+  "date": "2026-10-07",
+  "execution_enabled": false,
+  "path_base": "repository_root",
+  "hash_algorithm": "sha256",
+  "source_artifacts": [
+    {
+      "path": "docs/RQ2_独立开发复验_草案01_2026-10-07.md",
+      "sha256": "f0941e5d1cd68561b6506354ea8f8eeb96f077b4734332461c088ac14030b2ea"
+    },
+    {
+      "path": "data/audit_rq2_replication_reserve.py",
+      "sha256": "0f9345b47b0d6e6256d880de7f7c226608521654d04d6a3b7cc046ad968059f9"
+    },
+    {
+      "path": "tests/test_rq2_replication_reserve.py",
+      "sha256": "29a536580ce24876794208f0983521554c64e8e6aa5adff02c34ee8013def368"
+    },
+    {
+      "path": "docs/rq2_independent_replication_draft01/proposal.json",
+      "sha256": "1142a8733498d3b3692d0bae17f2fdfd55a049149689286a7cefc60a50af641b"
+    },
+    {
+      "path": "docs/rq2_independent_replication_draft01/reserve_audit.json",
+      "sha256": "92153e94279d971c9a1f5727d478363a398591273a3f0e4dc37913e39d857710"
+    },
+    {
+      "path": "docs/rq2_independent_replication_draft01/selection_manifest.jsonl",
+      "sha256": "b2173f9707452d416d53b95175a3b8e1617c723ccdc4905ea6bbba8e356fa7d8"
+    }
+  ]
+}

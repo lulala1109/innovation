@@ -1,0 +1,84 @@
+{
+  "format": "rq2-v2-statistical-preregistration-addendum",
+  "version": 1,
+  "event_artifact_version": 3,
+  "pilot_gate_version": 2,
+  "formal_statistics_version": 3,
+  "revision_date": "2026-10-05",
+  "parent_layer_dose_record": {
+    "path": "configs/rq2_candidate_layer_preregistration_qwen7b_v2.json",
+    "sha256": "5c3a99b7347d400a48c117b44040d0f12f515b4cec66de304cc506a271f89a41"
+  },
+  "revision_from_v1": {
+    "event_baseline": "clean refusal is X_H eligibility; PGD step 0 refusal defines the within-trajectory event population; search starts at step 1",
+    "missing_event_labels": "clean and step 0 require valid labels; a missing earlier step makes the first transition unresolved; missing offsets stay missing",
+    "behavior_endpoints": "StrongREJECT utility reduction, explicit binary refusal recovery, and binary compliance change are separate outcomes",
+    "layer_controls": "neighbors describe local profiles; layers 2 and 12 are distant references, never depth-matched controls",
+    "doses": "1.0 primary restoration and suppression; 0.5 pilot sensitivity only; 1.5 excluded",
+    "statistical_families": "F1-F4 confirmatory, F5 descriptive, E1 same-event complete-case paired offset tests"
+  },
+  "design": {
+    "candidate_layers": [19, 24, 26, 27],
+    "neighbor_layers": [18, 20, 23, 25],
+    "distant_control_layers": [2, 12],
+    "formal_layers": "all_0_to_27",
+    "fixed_steps": [2, 10, 100],
+    "event_offsets": [-2, -1, 0, 1, 3],
+    "primary_restoration_dose": 1.0,
+    "primary_suppression_dose": 1.0,
+    "sensitivity_doses": [0.5],
+    "random_replicates": 3,
+    "minimum_valid_pairs": 20,
+    "bootstrap_unit": "pair_id",
+    "bootstrap_replicates": 2000,
+    "confidence": 0.95,
+    "fdr_alpha": 0.05,
+    "minimum_sign_consistency": 0.6,
+    "top_k": 5
+  },
+  "event_policy": {
+    "clean_refused": "required for X_H eligibility",
+    "t0_refused": "required for first refusal-weakening, non-refusal, and compliance events",
+    "first_event_search": "PGD steps 1 through 100",
+    "unknown_before_first_event": "unresolved_prior_missing_step",
+    "unknown_after_first_event": "retain event; unavailable offsets remain missing"
+  },
+  "endpoint_policy": {
+    "primary": "StrongREJECT utility reduction",
+    "refusal_confirmation": "paired explicit-refusal label; exact McNemar and pair-bootstrap CI",
+    "secondary": "paired compliance-label change",
+    "random_replicate_rule": "average within pair before statistics",
+    "claim_order": ["utility_reduction", "refusal_restoration", "r_specific_mechanism", "bidirectional_evidence", "state_dependent_effect"],
+    "state_dependent_effect_not_layer_migration": true
+  },
+  "formal_family_policy": {
+    "F1_fixed_utility": 84,
+    "F2_candidate_refusal": 12,
+    "F3_same_layer_specificity": 48,
+    "F4_reverse": 20,
+    "F5_neighbor_profile": 21,
+    "F5_distant_profile": 24,
+    "F5_event_first_refusal_weakening_step": 20,
+    "F5_event_first_non_refusal_step": 20,
+    "F5_event_first_compliance_step": 20,
+    "E1_paired_offset_first_refusal_weakening_step": 4,
+    "E1_paired_offset_first_non_refusal_step": 4,
+    "E1_paired_offset_first_compliance_step": 4
+  },
+  "inference_policy": {
+    "fdr": "BH separately within each frozen family; incomplete slots use p=1 and report q as missing",
+    "minimum_valid_pairs": 20,
+    "continuous_test": "two-sided one-sample t-test on pair-level differences",
+    "binary_test": "two-sided exact McNemar",
+    "bootstrap": "pair-level 95 percent CI with 2000 resamples",
+    "support": "positive effect, positive CI lower bound, q <= 0.05, pair N >= 20, sign consistency >= 0.60",
+    "event_E1": "same-event five-offset complete cases; mean(0,+1,+3) minus mean(-2,-1)",
+    "equal_norm_audit": "actual generation shift L2 must be recorded; non-sham same-layer controls require <=5 percent pair-level relative error",
+    "sham_zero_audit": "actual generation shift L2 must be exactly zero"
+  },
+  "limitations": {
+    "T0_5": "conservative automated screening without manual semantic-independence or audio-content-fidelity review",
+    "severity_proxy": "not provided by this run; fixed PGD steps are not mild/moderate/severe bins",
+    "smoke_and_pilot": "engineering and go/no-go only; no causal claims"
+  }
+}

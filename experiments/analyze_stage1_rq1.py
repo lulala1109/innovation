@@ -19,7 +19,7 @@ import math
 import os
 import tempfile
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -28,9 +28,11 @@ from scipy import optimize, stats
 
 
 SCORE_FORMAT = "stage1-trajectory-scores"
-SCORE_VERSION = 1
+SUPPORTED_SCORE_VERSIONS = (1, 2)
 ANALYSIS_FORMAT = "stage1-rq1-analysis"
 ANALYSIS_VERSION = 1
+POPULATION_ANALYSIS_FORMAT = "stage1-rq1-population-analysis"
+POPULATION_ANALYSIS_VERSION = 1
 PRIMARY_METRICS = ("H_probe", "R_probe")
 EXPECTED_SCORE_KEYS = (
     "H_probe",
@@ -39,10 +41,25 @@ EXPECTED_SCORE_KEYS = (
     "R_direction",
 )
 PHASE_BOUNDS = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
+BEHAVIOR_TRAJECTORY_FIELDS = (
+    "behavior_label",
+    "refusal_label",
+    "compliance_label",
+    "jailbreak_success",
+    "refusal_score",
+    "strongreject_score",
+    "convincingness",
+    "specificity",
+    "generation_status",
+    "label_status",
+    "response_sha256",
+    "continuous_behavior_status",
+)
 
 
 @dataclass(frozen=True)
 class ValidatedScoreData:
+    score_version: int
     case_ids: tuple[str, ...]
     pair_ids: tuple[str, ...]
     layers: tuple[Any, ...]
@@ -107,11 +124,111 @@ def _numpy_tensor(value: Any, *, name: str, ndim: int) -> np.ndarray:
     return np.ascontiguousarray(result)
 
 
+def _validate_legacy_behavior_projection(
+    item: Mapping[str, Any],
+    *,
+    case_id: str,
+    pair_id: str,
+    step: int,
+    source: str,
+) -> Mapping[str, Any]:
+    """Validate a response-free projection produced while reading replay v1."""
+
+    from experiments.stage1_behavior_contract import (
+        BEHAVIOR_FIELDS,
+        CONTINUOUS_BEHAVIOR_FIELDS,
+        SENSITIVE_BEHAVIOR_FIELDS,
+    )
+
+    sensitive = sorted(SENSITIVE_BEHAVIOR_FIELDS.intersection(item))
+    if sensitive:
+        raise ValueError(
+            f"{source} contains forbidden sensitive fields: "
+            + ", ".join(sensitive)
+        )
+    if set(item) != set(BEHAVIOR_FIELDS):
+        raise ValueError(f"{source} fields do not match behavior schema v2")
+    if (item.get("case_id"), item.get("pair_id"), item.get("step")) != (
+        case_id,
+        pair_id,
+        step,
+    ):
+        raise ValueError(f"{source} identity does not match score axes")
+    if item.get("continuous_behavior_status") != "unavailable":
+        raise ValueError(
+            f"{source} must mark replay-v1 continuous behavior unavailable"
+        )
+    if any(item.get(field) is not None for field in CONTINUOUS_BEHAVIOR_FIELDS):
+        raise ValueError(
+            f"{source} must not infer continuous behavior from replay v1"
+        )
+    if item.get("behavior_label") is not None:
+        raise ValueError(f"{source} must not infer behavior_label from replay v1")
+
+    generation = item.get("generation_status")
+    label_status = item.get("label_status")
+    digest = item.get("response_sha256")
+    if generation not in {"ok", "error", "missing"}:
+        raise ValueError(f"{source} has invalid generation_status")
+    if label_status not in {"ok", "unknown", "missing"}:
+        raise ValueError(f"{source} has invalid label_status")
+    if digest is not None and (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"{source} has invalid response_sha256")
+    decisions = tuple(
+        item.get(field)
+        for field in (
+            "refusal_label",
+            "compliance_label",
+            "jailbreak_success",
+        )
+    )
+    if label_status == "ok":
+        if generation != "ok" or digest is None:
+            raise ValueError(f"{source} has inconsistent ok provenance")
+        if any(not isinstance(value, bool) for value in decisions):
+            raise ValueError(f"{source} ok labels must be boolean")
+        if (decisions[0] and decisions[1]) or decisions[1] != decisions[2]:
+            raise ValueError(f"{source} categorical labels are inconsistent")
+    else:
+        if any(value is not None for value in decisions):
+            raise ValueError(f"{source} non-ok labels must be null")
+        if label_status == "missing":
+            if generation != "missing" or digest is not None:
+                raise ValueError(f"{source} missing provenance is inconsistent")
+        elif generation not in {"ok", "error"} or digest is None:
+            raise ValueError(f"{source} unknown provenance is inconsistent")
+    return item
+
+
 def _normalize_behavior(
-    value: Any, *, cases: int, steps: int
+    value: Any,
+    *,
+    cases: int,
+    steps: int,
+    score_version: int,
+    case_ids: Sequence[str],
+    pair_ids: Sequence[str],
+    step_values: Sequence[int],
+    scoring_protocol: Optional[Mapping[str, Any]] = None,
+    legacy_projection: bool = False,
 ) -> tuple[tuple[Mapping[str, Any], ...], ...]:
     if value is None:
-        return tuple(tuple({"label_status": "missing"} for _ in range(steps)) for _ in range(cases))
+        if score_version == 2:
+            raise ValueError("score v2 requires a complete behavior grid")
+        return tuple(
+            tuple(
+                {
+                    "label_status": "missing",
+                    "continuous_behavior_status": "unavailable",
+                }
+                for _ in range(steps)
+            )
+            for _ in range(cases)
+        )
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError("behavior must be a case-by-step sequence")
     if len(value) != cases:
@@ -130,7 +247,73 @@ def _normalize_behavior(
                 raise ValueError(
                     f"behavior[{case_index}][{step_index}] must be an object"
                 )
-            case_values.append(dict(item))
+            # Keep the analysis boundary deliberately narrow. Legacy replay
+            # rows can contain response text; analysis and CSV output must
+            # never retain or re-emit it.
+            expected_identity = (
+                case_ids[case_index],
+                pair_ids[case_index],
+                int(step_values[step_index]),
+            )
+            source = f"behavior[{case_index}][{step_index}]"
+            if score_version == 2 and not legacy_projection:
+                from experiments.stage1_behavior_contract import (
+                    validate_projected_behavior,
+                )
+
+                if scoring_protocol is None:
+                    raise ValueError(
+                        "score v2 behavior requires an embedded scoring protocol"
+                    )
+                item = validate_projected_behavior(
+                    item,
+                    scoring_protocol=scoring_protocol,
+                    source=source,
+                )
+                actual_identity = (
+                    item.get("case_id"),
+                    item.get("pair_id"),
+                    item.get("step"),
+                )
+                if actual_identity != expected_identity:
+                    raise ValueError(
+                        f"{source} identity {actual_identity!r} does not "
+                        f"match axes {expected_identity!r}"
+                    )
+            elif legacy_projection:
+                item = _validate_legacy_behavior_projection(
+                    item,
+                    case_id=expected_identity[0],
+                    pair_id=expected_identity[1],
+                    step=expected_identity[2],
+                    source=source,
+                )
+            projected = {
+                field: item.get(field) for field in BEHAVIOR_TRAJECTORY_FIELDS
+            }
+            projected["label_status"] = str(
+                item.get("label_status", "missing")
+            ).strip().casefold() or "missing"
+            if score_version == 1:
+                for field in (
+                    "refusal_score",
+                    "strongreject_score",
+                    "convincingness",
+                    "specificity",
+                ):
+                    projected[field] = None
+                projected["continuous_behavior_status"] = "unavailable"
+            else:
+                availability = str(
+                    item.get("continuous_behavior_status", "")
+                ).strip().casefold()
+                if availability not in {"available", "unavailable"}:
+                    raise ValueError(
+                        "score v2 behavior rows require "
+                        "continuous_behavior_status=available|unavailable"
+                    )
+                projected["continuous_behavior_status"] = availability
+            case_values.append(projected)
         normalized.append(tuple(case_values))
     return tuple(normalized)
 
@@ -140,13 +323,60 @@ def validate_score_payload(payload: Mapping[str, Any]) -> ValidatedScoreData:
 
     if not isinstance(payload, Mapping):
         raise TypeError("score payload must be a mapping")
-    if payload.get("format") != SCORE_FORMAT or payload.get("version") != SCORE_VERSION:
+    score_version = payload.get("version")
+    if (
+        payload.get("format") != SCORE_FORMAT
+        or isinstance(score_version, bool)
+        or score_version not in SUPPORTED_SCORE_VERSIONS
+    ):
         raise ValueError(
-            f"score payload must use format={SCORE_FORMAT!r}, version={SCORE_VERSION}"
+            f"score payload must use format={SCORE_FORMAT!r}, version in "
+            f"{SUPPORTED_SCORE_VERSIONS}"
         )
     metadata = payload.get("metadata", {})
     if not isinstance(metadata, Mapping):
         raise ValueError("metadata must be an object")
+    scoring_protocol: Optional[Mapping[str, Any]] = None
+    legacy_projection = False
+    if score_version == 2:
+        from experiments.stage1_behavior_contract import (
+            BEHAVIOR_FIELDS,
+            BEHAVIOR_SCHEMA_VERSION,
+            validate_behavior_contract,
+        )
+
+        if metadata.get("behavior_schema_version") != BEHAVIOR_SCHEMA_VERSION:
+            raise ValueError(
+                f"score v2 requires behavior_schema_version="
+                f"{BEHAVIOR_SCHEMA_VERSION}"
+            )
+        if metadata.get("behavior_fields") != list(BEHAVIOR_FIELDS):
+            raise ValueError("score v2 behavior_fields changed")
+        source_replay_version = metadata.get("source_replay_version")
+        if isinstance(source_replay_version, bool) or source_replay_version not in (
+            1,
+            2,
+        ):
+            raise ValueError("score v2 source_replay_version must be 1 or 2")
+        if source_replay_version == 2:
+            if metadata.get("continuous_behavior_status") != "available":
+                raise ValueError(
+                    "score v2 sourced from replay v2 must advertise available "
+                    "continuous behavior"
+                )
+            contract = validate_behavior_contract(metadata.get("behavior_contract"))
+            scoring_protocol = contract["scoring_protocol"]
+        else:
+            if metadata.get("continuous_behavior_status") != "unavailable":
+                raise ValueError(
+                    "score v2 sourced from replay v1 must advertise unavailable "
+                    "continuous behavior"
+                )
+            if metadata.get("behavior_contract") is not None:
+                raise ValueError(
+                    "score v2 sourced from replay v1 must not invent a behavior contract"
+                )
+            legacy_projection = True
     if metadata.get("probe_version") != 2 or metadata.get("directions_missing") is True:
         raise ValueError(
             "RQ1 analysis requires a provenance-verified v2 probe with independent "
@@ -228,9 +458,18 @@ def validate_score_payload(payload: Mapping[str, Any]) -> ValidatedScoreData:
             f"attack_loss must have shape [{case_count},{step_count}]"
         )
     behavior = _normalize_behavior(
-        payload.get("behavior"), cases=case_count, steps=step_count
+        payload.get("behavior"),
+        cases=case_count,
+        steps=step_count,
+        score_version=int(score_version),
+        case_ids=case_ids,
+        pair_ids=pair_ids,
+        step_values=steps.tolist(),
+        scoring_protocol=scoring_protocol,
+        legacy_projection=legacy_projection,
     )
     return ValidatedScoreData(
+        score_version=int(score_version),
         case_ids=case_ids,
         pair_ids=pair_ids,
         layers=layers,
@@ -1134,8 +1373,189 @@ def _event_aligned_statistics(
     return rows
 
 
-def analyze_stage1_rq1(
-    payload: Mapping[str, Any],
+def _behavior_trajectory(data: ValidatedScoreData) -> list[dict[str, Any]]:
+    """Return one safe, response-free row per case and optimization step."""
+
+    population = str(data.metadata.get("analysis_population", "all"))
+    rows: list[dict[str, Any]] = []
+    for case_index, (case_id, pair_id) in enumerate(
+        zip(data.case_ids, data.pair_ids)
+    ):
+        for step_index, step in enumerate(data.steps):
+            behavior = data.behavior[case_index][step_index]
+            row: dict[str, Any] = {
+                "population": population,
+                "case_id": case_id,
+                "pair_id": pair_id,
+                "step": int(step),
+                "progress": float(data.progress[step_index]),
+            }
+            for field in BEHAVIOR_TRAJECTORY_FIELDS:
+                row[field] = behavior.get(field)
+            rows.append(row)
+    return rows
+
+
+def _baseline_population_audit(
+    data: ValidatedScoreData,
+) -> tuple[list[dict[str, Any]], dict[str, int], tuple[int, ...]]:
+    """Classify t=0 eligibility without treating either population as primary."""
+
+    rows: list[dict[str, Any]] = []
+    eligible_indices: list[int] = []
+    counts = {
+        "all": len(data.case_ids),
+        "baseline_refused": 0,
+        "t0_label_ok": 0,
+        "t0_unknown": 0,
+        "t0_missing": 0,
+        "t0_non_refusal": 0,
+        "t0_compliance": 0,
+        "t0_non_refusal_and_compliance": 0,
+        "t0_invalid_refusal_label": 0,
+    }
+    for case_index, (case_id, pair_id) in enumerate(
+        zip(data.case_ids, data.pair_ids)
+    ):
+        t0 = data.behavior[case_index][0]
+        status = str(t0.get("label_status", "missing")).strip().casefold()
+        if not status:
+            status = "missing"
+        refusal = t0.get("refusal_label")
+        compliance = t0.get("compliance_label")
+        status_ok = status == "ok"
+        eligible = status_ok and refusal is True
+        non_refusal = status_ok and refusal is False
+        compliant = status_ok and compliance is True
+        unknown = status not in {"ok", "missing"}
+        missing = status == "missing"
+        invalid_refusal = status_ok and not isinstance(refusal, bool)
+
+        if eligible:
+            eligible_indices.append(case_index)
+            reason = ""
+        elif missing:
+            reason = "t0_missing"
+        elif unknown:
+            reason = "t0_unknown"
+        elif invalid_refusal:
+            reason = "t0_invalid_refusal_label"
+        elif non_refusal and compliant:
+            reason = "t0_non_refusal_and_compliance"
+        else:
+            reason = "t0_non_refusal"
+
+        counts["t0_label_ok"] += int(status_ok)
+        counts["t0_unknown"] += int(unknown)
+        counts["t0_missing"] += int(missing)
+        counts["t0_non_refusal"] += int(non_refusal)
+        counts["t0_compliance"] += int(compliant)
+        counts["t0_non_refusal_and_compliance"] += int(non_refusal and compliant)
+        counts["t0_invalid_refusal_label"] += int(invalid_refusal)
+        rows.append(
+            {
+                "case_id": case_id,
+                "pair_id": pair_id,
+                "t0_label_status": status,
+                "t0_refusal_label": refusal,
+                "t0_compliance_label": compliance,
+                "baseline_refused_eligible": eligible,
+                "t0_unknown": unknown,
+                "t0_missing": missing,
+                "t0_non_refusal": non_refusal,
+                "t0_compliance": compliant,
+                "included_in_all": True,
+                "included_in_baseline_refused": eligible,
+                "exclusion_reason": reason,
+            }
+        )
+    counts["baseline_refused"] = len(eligible_indices)
+    return rows, counts, tuple(eligible_indices)
+
+
+def _population_view(
+    data: ValidatedScoreData,
+    *,
+    indices: Sequence[int],
+    name: str,
+    counts: Mapping[str, int],
+) -> ValidatedScoreData:
+    selected = np.asarray(tuple(indices), dtype=np.int64)
+    metadata = dict(data.metadata)
+    metadata.update(
+        {
+            "analysis_population": name,
+            "analysis_population_num_pairs": int(len(selected)),
+            "population_policy": "symmetric-no-primary-population",
+            "primary_population": None,
+            "population_audit_counts": dict(counts),
+            "source_score_version": int(data.score_version),
+        }
+    )
+    return replace(
+        data,
+        case_ids=tuple(data.case_ids[index] for index in selected),
+        pair_ids=tuple(data.pair_ids[index] for index in selected),
+        scores=OrderedDict(
+            (key, value[selected, :, :]) for key, value in data.scores.items()
+        ),
+        attack_loss=data.attack_loss[selected, :],
+        behavior=tuple(data.behavior[index] for index in selected),
+        metadata=metadata,
+    )
+
+
+def _empty_population_result(
+    data: ValidatedScoreData,
+    *,
+    confidence: float,
+    bootstrap_replicates: int,
+    seed: int,
+    weakening_threshold: float,
+) -> Mapping[str, Any]:
+    return {
+        "format": ANALYSIS_FORMAT,
+        "version": ANALYSIS_VERSION,
+        "axes": {
+            "case_ids": [],
+            "pair_ids": [],
+            "layers": list(data.layers),
+            "steps": data.steps.tolist(),
+            "progress": data.progress.tolist(),
+        },
+        "phase_definition": {
+            "early": "0 <= progress < 1/3",
+            "middle": "1/3 <= progress < 2/3",
+            "late": "2/3 <= progress <= 1",
+            "bounds": list(PHASE_BOUNDS),
+        },
+        "cell_statistics": [],
+        "phase_profiles": [],
+        "attack_loss_statistics": [],
+        "loss_state_correlations": [],
+        "profile_reproducibility": [],
+        "layer_slopes": [],
+        "behavior_events": [],
+        "behavior_trajectory": [],
+        "event_aligned_statistics": [],
+        "mixed_effects": None,
+        "metadata": {
+            "confidence": float(confidence),
+            "bootstrap_replicates": int(bootstrap_replicates),
+            "bootstrap_unit": "pair_id",
+            "seed": seed,
+            "weakening_threshold": float(weakening_threshold),
+            "source_metadata": dict(data.metadata),
+            "empty_population": True,
+            "interpretation_guardrail": (
+                "H-stable/R-decreasing is a tested hypothesis, not a selection rule"
+            ),
+        },
+    }
+
+
+def _analyze_validated_rq1(
+    data: ValidatedScoreData,
     *,
     confidence: float = 0.95,
     bootstrap_replicates: int = 1000,
@@ -1143,13 +1563,13 @@ def analyze_stage1_rq1(
     weakening_threshold: float = 0.1,
     include_mixed_effects: bool = True,
 ) -> Mapping[str, Any]:
-    """Return RQ1-a/b/c tables and preregistered statistical tests."""
+    """Analyze one already validated RQ1 population."""
 
     if not 0.0 < float(confidence) < 1.0:
         raise ValueError("confidence must be within (0,1)")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer")
-    data = validate_score_payload(payload)
+
     if include_mixed_effects and len(data.layers) < 2:
         raise ValueError(
             "Layer-effect mixed models require at least two layers; provide a "
@@ -1236,6 +1656,7 @@ def analyze_stage1_rq1(
         "profile_reproducibility": reproducibility,
         "layer_slopes": layer_slopes,
         "behavior_events": behavior_events,
+        "behavior_trajectory": _behavior_trajectory(data),
         "event_aligned_statistics": event_aligned,
         "mixed_effects": mixed_effects,
         "metadata": {
@@ -1248,6 +1669,88 @@ def analyze_stage1_rq1(
             "interpretation_guardrail": (
                 "H-stable/R-decreasing is a tested hypothesis, not a selection rule"
             ),
+        },
+    }
+
+
+
+def analyze_stage1_rq1(
+    payload: Mapping[str, Any],
+    *,
+    confidence: float = 0.95,
+    bootstrap_replicates: int = 1000,
+    seed: int = 42,
+    weakening_threshold: float = 0.1,
+    include_mixed_effects: bool = True,
+) -> Mapping[str, Any]:
+    """Return the legacy-compatible all-case RQ1 analysis."""
+
+    return _analyze_validated_rq1(
+        validate_score_payload(payload),
+        confidence=confidence,
+        bootstrap_replicates=bootstrap_replicates,
+        seed=seed,
+        weakening_threshold=weakening_threshold,
+        include_mixed_effects=include_mixed_effects,
+    )
+
+def analyze_stage1_rq1_populations(
+    payload: Mapping[str, Any],
+    *,
+    confidence: float = 0.95,
+    bootstrap_replicates: int = 1000,
+    seed: int = 42,
+    weakening_threshold: float = 0.1,
+    include_mixed_effects: bool = True,
+) -> Mapping[str, Any]:
+    """Analyze all held-out cases and the baseline-refused subset symmetrically."""
+
+    data = validate_score_payload(payload)
+    audit, counts, eligible_indices = _baseline_population_audit(data)
+    selections = OrderedDict(
+        (
+            ("all", tuple(range(len(data.case_ids)))),
+            ("baseline_refused", eligible_indices),
+        )
+    )
+    populations: "OrderedDict[str, Mapping[str, Any]]" = OrderedDict()
+    for name, indices in selections.items():
+        view = _population_view(data, indices=indices, name=name, counts=counts)
+        if indices:
+            populations[name] = _analyze_validated_rq1(
+                view,
+                confidence=confidence,
+                bootstrap_replicates=bootstrap_replicates,
+                seed=seed,
+                weakening_threshold=weakening_threshold,
+                include_mixed_effects=include_mixed_effects,
+            )
+        else:
+            populations[name] = _empty_population_result(
+                view,
+                confidence=confidence,
+                bootstrap_replicates=bootstrap_replicates,
+                seed=seed,
+                weakening_threshold=weakening_threshold,
+            )
+    return {
+        "format": POPULATION_ANALYSIS_FORMAT,
+        "version": POPULATION_ANALYSIS_VERSION,
+        "population_policy": {
+            "mode": "both",
+            "eligibility": (
+                "t0 label_status=ok and refusal_label=true"
+            ),
+            "comparison": "symmetric-no-primary-population",
+            "primary_population": None,
+            "population_names": list(selections),
+        },
+        "population_counts": counts,
+        "population_audit": audit,
+        "populations": populations,
+        "metadata": {
+            "source_score_version": int(data.score_version),
+            "source_metadata": dict(data.metadata),
         },
     }
 
@@ -1322,6 +1825,7 @@ def write_rq1_outputs(
         "profile_reproducibility",
         "layer_slopes",
         "behavior_events",
+        "behavior_trajectory",
         "event_aligned_statistics",
     )
     artifacts: dict[str, str] = {}
@@ -1330,10 +1834,8 @@ def write_rq1_outputs(
         if not isinstance(rows, Sequence):
             raise ValueError(f"analysis result {name} must be a sequence")
         path = output / f"{name}.csv"
-        _atomic_csv(
-            path,
-            rows,
-            empty_fields=(
+        if name == "event_aligned_statistics":
+            empty_fields = (
                 "event",
                 "metric",
                 "layer",
@@ -1348,9 +1850,18 @@ def write_rq1_outputs(
                 "sample_count",
                 "pair_count",
             )
-            if name == "event_aligned_statistics"
-            else ("status",),
-        )
+        elif name == "behavior_trajectory":
+            empty_fields = (
+                "population",
+                "case_id",
+                "pair_id",
+                "step",
+                "progress",
+                *BEHAVIOR_TRAJECTORY_FIELDS,
+            )
+        else:
+            empty_fields = ("status",)
+        _atomic_csv(path, rows, empty_fields=empty_fields)
         artifacts[name] = str(path)
     mixed_path = output / "mixed_effects.json"
     _atomic_json(mixed_path, result.get("mixed_effects"))
@@ -1367,6 +1878,98 @@ def write_rq1_outputs(
     return artifacts
 
 
+def write_rq1_population_outputs(
+    result: Mapping[str, Any],
+    output_dir: str | Path,
+    *,
+    make_plots: bool = False,
+    generate_reports: bool = True,
+) -> Mapping[str, Any]:
+    """Write the two population views with an auditable, non-primary index."""
+
+    if (
+        result.get("format") != POPULATION_ANALYSIS_FORMAT
+        or result.get("version") != POPULATION_ANALYSIS_VERSION
+    ):
+        raise ValueError("result must be a Stage-1 RQ1 population analysis")
+    policy = result.get("population_policy")
+    populations = result.get("populations")
+    audit = result.get("population_audit")
+    if not isinstance(policy, Mapping) or policy.get("primary_population") is not None:
+        raise ValueError("dual-population analysis must not designate a primary view")
+    if not isinstance(populations, Mapping) or tuple(populations) != (
+        "all",
+        "baseline_refused",
+    ):
+        raise ValueError("dual-population analysis requires symmetric named views")
+    if isinstance(audit, (str, bytes)) or not isinstance(audit, Sequence):
+        raise ValueError("population_audit must be a sequence")
+
+    output = Path(output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    audit_path = output / "population_audit.csv"
+    _atomic_csv(
+        audit_path,
+        audit,
+        empty_fields=(
+            "case_id",
+            "pair_id",
+            "t0_label_status",
+            "baseline_refused_eligible",
+            "exclusion_reason",
+        ),
+    )
+
+    from reporting.generate_stage1_rq1_report import generate_stage1_rq1_report
+
+    population_artifacts: dict[str, Mapping[str, Any]] = {}
+    population_index: dict[str, Any] = {
+        "format": POPULATION_ANALYSIS_FORMAT,
+        "version": POPULATION_ANALYSIS_VERSION,
+        "population_policy": dict(policy),
+        "population_counts": dict(result.get("population_counts", {})),
+        "populations": {},
+        "source_score_version": result.get("metadata", {}).get(
+            "source_score_version"
+        ),
+    }
+    for name in ("all", "baseline_refused"):
+        analysis = populations[name]
+        destination = output / name
+        artifacts: dict[str, Any] = dict(
+            write_rq1_outputs(analysis, destination)
+        )
+        if generate_reports:
+            artifacts.update(
+                generate_stage1_rq1_report(
+                    analysis,
+                    destination,
+                    # Empty eligible populations still get a report, but have no
+                    # cells from which a meaningful figure could be rendered.
+                    make_plots=(
+                        make_plots and bool(analysis.get("cell_statistics"))
+                    ),
+                )
+            )
+        population_artifacts[name] = artifacts
+        axes = analysis.get("axes", {})
+        population_index["populations"][name] = {
+            "case_count": len(axes.get("case_ids", [])),
+            "case_ids": list(axes.get("case_ids", [])),
+            "pair_ids": list(axes.get("pair_ids", [])),
+            "output_dir": str(destination),
+            "artifacts": artifacts,
+        }
+
+    index_path = output / "population_index.json"
+    _atomic_json(index_path, population_index)
+    return {
+        "population_audit": str(audit_path),
+        "population_index": str(index_path),
+        "populations": population_artifacts,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scores", required=True, type=Path)
@@ -1375,7 +1978,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-replicates", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--weakening-threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--population",
+        choices=("all", "both"),
+        default="all",
+        help=(
+            "Legacy all-case output (default), or symmetric all/baseline-refused "
+            "outputs with a root population audit"
+        ),
+    )
     parser.add_argument("--skip-mixed-effects", action="store_true")
+    parser.add_argument(
+        "--analysis-only",
+        action="store_true",
+        help="Write analysis artifacts but defer Markdown/figures to report stage",
+    )
     parser.add_argument(
         "--make-plots",
         action="store_true",
@@ -1386,24 +2003,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.analysis_only and args.make_plots:
+        raise ValueError("--make-plots belongs to the deferred report stage")
     payload = load_score_payload(args.scores)
-    result = analyze_stage1_rq1(
-        payload,
-        confidence=args.confidence,
-        bootstrap_replicates=args.bootstrap_replicates,
-        seed=args.seed,
-        weakening_threshold=args.weakening_threshold,
-        include_mixed_effects=not args.skip_mixed_effects,
-    )
-    artifacts = write_rq1_outputs(result, args.output_dir)
-    from reporting.generate_stage1_rq1_report import generate_stage1_rq1_report
+    analysis_kwargs = {
+        "confidence": args.confidence,
+        "bootstrap_replicates": args.bootstrap_replicates,
+        "seed": args.seed,
+        "weakening_threshold": args.weakening_threshold,
+        "include_mixed_effects": not args.skip_mixed_effects,
+    }
+    if args.population == "both":
+        result = analyze_stage1_rq1_populations(payload, **analysis_kwargs)
+        artifacts = write_rq1_population_outputs(
+            result,
+            args.output_dir,
+            make_plots=args.make_plots,
+            generate_reports=not args.analysis_only,
+        )
+    else:
+        result = analyze_stage1_rq1(payload, **analysis_kwargs)
+        artifacts = write_rq1_outputs(result, args.output_dir)
+        if not args.analysis_only:
+            from reporting.generate_stage1_rq1_report import (
+                generate_stage1_rq1_report,
+            )
 
-    report = generate_stage1_rq1_report(
-        result,
-        args.output_dir,
-        make_plots=args.make_plots,
-    )
-    artifacts = {**artifacts, **report}
+            report = generate_stage1_rq1_report(
+                result,
+                args.output_dir,
+                make_plots=args.make_plots,
+            )
+            artifacts = {**artifacts, **report}
     print(json.dumps(artifacts, ensure_ascii=False, indent=2))
     return 0
 
@@ -1415,8 +2046,11 @@ if __name__ == "__main__":
 __all__ = [
     "ANALYSIS_FORMAT",
     "ANALYSIS_VERSION",
+    "POPULATION_ANALYSIS_FORMAT",
+    "POPULATION_ANALYSIS_VERSION",
     "ValidatedScoreData",
     "analyze_stage1_rq1",
+    "analyze_stage1_rq1_populations",
     "build_parser",
     "fit_random_intercept_model",
     "load_score_payload",
@@ -1424,4 +2058,5 @@ __all__ = [
     "phase_for_progress",
     "validate_score_payload",
     "write_rq1_outputs",
+    "write_rq1_population_outputs",
 ]

@@ -1,0 +1,31 @@
+{
+  "format": "rq2-event-dev-pilot",
+  "version": 3,
+  "name": "qwen7b_advbench_event_dev_v3_run01",
+  "execution_enabled": true,
+  "output_root": "outputs/stage2_rq2/event_dev/qwen7b_advbench_event_dev_v3_run01",
+  "source_config": {
+    "path": "configs/stage2_rq2_qwen7b_advbench_dev_screen01.json",
+    "sha256": "e3dc650dab90ce8438ccd67d936ef8b041edad30ac4086a9977d91dbe843c1af"
+  },
+  "source_artifacts": {
+    "pipeline_state.json": "618f7cbbb5bfb091ebd46e7a89a65719e64912a132aa8bf0d39a75ce70ebf1a2",
+    "baseline_screen/summary.json": "ea041138f9790d88f1a1f311d1cfe305c4ad22c40d16dafb0b84cb048f3258c6",
+    "trajectory/summary.json": "9ecac9cdaffdec1f65223ec50aebd6b798e0a67fb2dc3761be87d7cc6999b7c2",
+    "trajectory/resolved_manifest.json": "98df255ec56a07a4b578e8aa523efed594ffb6b1df0cd4316a164f3f3631ed06",
+    "trajectory_behavior/scan_index.json": "abb9714f7f22719a07374b086e293bba706bbdb08e2499bc72e64d3fb551e9c7",
+    "trajectory_behavior/trials.jsonl": "4033113cce96db82b57d9483aa89e09f2bb116a38af07b7b4658c72334079b41",
+    "trajectory_behavior/responses.jsonl": "b7891f8164ec0370ec4f5de2a2eb143a216e30d5a18cc71af96c8e3a2d62b8a9",
+    "trajectory_behavior/labels.jsonl": "079ae900cb5dc4ef5c6f7d05ccc14130336ba0925fbd92174efcb4b0c99774cc",
+    "provenance/rq1_sources.json": "a06bfa6d4961a9d9003cd23597baec92e6a86255e8a3ae8acfa335fe19fb37c5",
+    "provenance/reference_statistics.json": "556823916e7ff79c3bc3578cc9b9940447fc19e7f079b82323b74f3a9cd225e6"
+  },
+  "protocol": {
+    "path": "docs/RQ2_7B_v3_事件中心_dev协议_2026-10-06.md",
+    "sha256": "d44b31359611c4b913ef513afcb49265ff3a05bef383567c93353f0f3b2f0d3f"
+  },
+  "preregistration": {
+    "path": "configs/rq2_event_preregistration_qwen7b_advbench_event_dev_v3_run01.json",
+    "sha256": "54b881606c06255e2ca6f41052c6f4cc725a6eb1cadcac7a12040ae183ab6c01"
+  }
+}

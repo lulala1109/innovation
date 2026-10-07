@@ -91,7 +91,7 @@ class StrongRejectEvaluatorTests(unittest.TestCase):
         self.assertFalse(behavior.balanced_strongreject_success(1, 5, 5))
 
     def test_invalid_json_schema_fails_fast(self):
-        evaluator = behavior.StrongRejectEvaluator()
+        evaluator = behavior.StrongRejectEvaluator(schema_retries=0)
         invalid_responses = [
             "",
             "not json",
@@ -115,6 +115,67 @@ class StrongRejectEvaluatorTests(unittest.TestCase):
                 evaluator.backend.response = response
                 with self.assertRaisesRegex(ValueError, "invalid JSON"):
                     evaluator.evaluate("request", "response")
+
+    def test_invalid_schema_is_reprompted_and_can_recover(self):
+        evaluator = behavior.StrongRejectEvaluator(schema_retries=2)
+        invalid = json.dumps({
+            "overall_reasoning": "The response does not answer the request.",
+            "refusal": 1,
+            "convincingness": 1,
+            "specificity": 1,
+            "unexpected reasoning key": "must be rejected",
+        })
+        valid = json.dumps({
+            "overall_reasoning": "The response does not answer the request.",
+            "refusal": 1,
+            "convincingness": 1,
+            "specificity": 1,
+        })
+
+        with patch.object(
+            evaluator.backend,
+            "create_json_completion",
+            side_effect=[invalid, valid],
+        ) as completion:
+            result = evaluator.evaluate("request", "response")
+
+        self.assertEqual(completion.call_count, 2)
+        retry_messages = completion.call_args_list[1].kwargs["messages"]
+        self.assertEqual(retry_messages[-2], {
+            "role": "assistant",
+            "content": invalid,
+        })
+        self.assertIn("exactly these four keys", retry_messages[-1]["content"])
+        self.assertEqual(result["refusal"], 1.0)
+        self.assertEqual(result["score"], 0.0)
+        self.assertEqual(result["raw_response"], valid)
+        self.assertEqual(result["schema_validation_attempts"], 2)
+
+    def test_invalid_schema_exhausts_bounded_retries(self):
+        evaluator = behavior.StrongRejectEvaluator(schema_retries=2)
+        evaluator.backend.response = json.dumps({
+            "overall_reasoning": "extra key must remain invalid",
+            "refusal": 1,
+            "convincingness": 1,
+            "specificity": 1,
+            "unexpected": True,
+        })
+
+        with patch.object(
+            evaluator.backend,
+            "create_json_completion",
+            wraps=evaluator.backend.create_json_completion,
+        ) as completion:
+            with self.assertRaisesRegex(ValueError, "after 3 attempt"):
+                evaluator.evaluate("request", "response")
+
+        self.assertEqual(completion.call_count, 3)
+
+    def test_schema_retries_must_be_a_non_negative_integer(self):
+        for value in (-1, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "schema_retries"):
+                    behavior.StrongRejectEvaluator(schema_retries=value)
 
     def test_provider_error_propagates(self):
         evaluator = behavior.StrongRejectEvaluator()

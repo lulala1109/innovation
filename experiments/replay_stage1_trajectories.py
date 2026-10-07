@@ -27,15 +27,48 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from experiments.stage1_behavior_contract import (
+    BehaviorContractError,
+    behavior_contract,
+    load_behavior_labels,
+    missing_behavior,
+    normalize_replay_behavior,
+    project_behavior_label,
+    sidecar_scoring_protocol,
+    validate_behavior_contract,
+    validate_projected_behavior,
+)
+
 
 OUTPUT_FORMAT = "stage1-trajectory-hidden-states"
 INDEX_FORMAT = "stage1-trajectory-hidden-state-index"
-OUTPUT_VERSION = 1
-INDEX_VERSION = 1
+OUTPUT_VERSION = 2
+INDEX_VERSION = 2
+SUPPORTED_OUTPUT_VERSIONS = frozenset((1, OUTPUT_VERSION))
+SUPPORTED_INDEX_VERSIONS = frozenset((1, INDEX_VERSION))
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _POOLING = frozenset(("mean", "max", "first", "last"))
 _TOKEN_SPANS = frozenset(("audio", "target", "all"))
+ROW_METADATA_FIELDS = (
+    "case_id",
+    "pair_id",
+    "step",
+    "total_steps",
+    "progress",
+    "phase",
+    "attack_loss",
+    "checkpoint_path",
+    "checkpoint_sha256",
+    "experiment_fingerprint",
+    "generation_status",
+    "label_status",
+    "response_sha256",
+    "forward_target_source",
+    "delta_linf",
+    "delta_rms",
+    "snr_db",
+)
 
 
 class Stage1TrajectoryReplayError(ValueError):
@@ -61,6 +94,7 @@ class _CaseSpec:
     total_steps: int
     checkpoints: tuple[Any, ...]
     checkpoint_metadata: Mapping[int, Mapping[str, Any]]
+    scoring_protocol: Mapping[str, Any]
     behavior_by_step: Mapping[int, Mapping[str, Any]]
 
 
@@ -287,11 +321,9 @@ def _artifact_path(case_dir: Path, value: Any) -> Path:
 
 
 def _load_label_index(path: Path) -> Mapping[tuple[str, str, int], Mapping[str, Any]]:
-    from experiments.collect_safety_states import _load_behavior_labels
-
     try:
-        return _load_behavior_labels(path)
-    except (ValueError, FileNotFoundError) as exc:
+        return load_behavior_labels(path)
+    except (BehaviorContractError, FileNotFoundError) as exc:
         raise Stage1TrajectoryReplayError(
             f"Invalid explicit behavior-label sidecar {path}: {exc}"
         ) from exc
@@ -435,6 +467,7 @@ def _case_spec(
     if label_index is None:
         label_index = _load_label_index(behavior_path)
         label_cache[behavior_path] = label_index
+    scoring_protocol = sidecar_scoring_protocol(label_index)
     behavior_by_step: dict[int, Mapping[str, Any]] = {}
     unexpected = []
     for identity, label in label_index.items():
@@ -496,6 +529,7 @@ def _case_spec(
         total_steps=total_steps,
         checkpoints=checkpoints,
         checkpoint_metadata=checkpoint_metadata,
+        scoring_protocol=scoring_protocol,
         behavior_by_step=behavior_by_step,
     )
 
@@ -524,36 +558,21 @@ def _normalized_behavior(
     label = spec.behavior_by_step.get(step)
     if label is None:
         return (
-            {
-                "case_id": spec.case_id,
-                "pair_id": spec.pair_id,
-                "step": step,
-                "generation_status": "missing",
-                "label_status": "missing",
-                "response": "",
-                "response_sha256": None,
-                "refusal_label": None,
-                "compliance_label": None,
-                "jailbreak_success": None,
-            },
+            missing_behavior(spec.case_id, spec.pair_id, step),
             spec.harmful_text,
             "harmful_text",
         )
-    status = str(label["label_status"]).strip().casefold()
     response = str(label.get("response", ""))
-    ok = status == "ok"
-    behavior = {
-        "case_id": spec.case_id,
-        "pair_id": spec.pair_id,
-        "step": step,
-        "generation_status": str(label["generation_status"]).strip().casefold(),
-        "label_status": status,
-        "response": response,
-        "response_sha256": label["response_sha256"],
-        "refusal_label": bool(label["refusal_label"]) if ok else None,
-        "compliance_label": bool(label["compliance_label"]) if ok else None,
-        "jailbreak_success": bool(label["jailbreak_success"]) if ok else None,
-    }
+    try:
+        behavior = project_behavior_label(
+            label,
+            source=f"{spec.behavior_path}:{spec.case_id}/{spec.pair_id}/{step}",
+            expected_protocol=spec.scoring_protocol,
+        )
+    except BehaviorContractError as exc:
+        raise Stage1TrajectoryReplayError(
+            f"Invalid behavior label for {spec.case_id}/{spec.pair_id}/{step}: {exc}"
+        ) from exc
     target = response if response.strip() else spec.harmful_text
     source = "response" if response.strip() else "harmful_text"
     return behavior, target, source
@@ -570,9 +589,9 @@ def _phase(progress: float) -> str:
 def _checkpoint_tensors(path: Path, *, step: int) -> tuple[Any, Any]:
     import torch
 
-    from experiments.collect_safety_states import _safe_torch_load
+    from experiments.collect_safety_states import safe_torch_load
 
-    payload = _safe_torch_load(path)
+    payload = safe_torch_load(path)
     tensors = payload.get("tensors", payload)
     if not isinstance(tensors, Mapping):
         raise Stage1TrajectoryReplayError(f"Checkpoint tensors are malformed: {path}")
@@ -626,7 +645,13 @@ def validate_replay_payload(
 
     if not isinstance(payload, Mapping):
         raise Stage1TrajectoryReplayError("Replay payload must be a mapping")
-    if payload.get("format") != OUTPUT_FORMAT or payload.get("version") != OUTPUT_VERSION:
+    version = payload.get("version")
+    if (
+        payload.get("format") != OUTPUT_FORMAT
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in SUPPORTED_OUTPUT_VERSIONS
+    ):
         raise Stage1TrajectoryReplayError("Unsupported replay payload format/version")
     case_id = _required_text(payload.get("case_id"), name="payload case_id")
     pair_id = _required_text(payload.get("pair_id"), name="payload pair_id")
@@ -636,6 +661,19 @@ def validate_replay_payload(
     metadata = payload.get("metadata")
     if not isinstance(metadata, Mapping):
         raise Stage1TrajectoryReplayError("payload metadata must be an object")
+    projected_protocol: Optional[Mapping[str, Any]] = None
+    if version == OUTPUT_VERSION:
+        try:
+            contract = validate_behavior_contract(metadata.get("behavior_contract"))
+        except BehaviorContractError as exc:
+            raise Stage1TrajectoryReplayError(
+                f"Invalid v2 behavior contract: {exc}"
+            ) from exc
+        projected_protocol = contract["scoring_protocol"]
+        if metadata.get("continuous_behavior_status") != "available":
+            raise Stage1TrajectoryReplayError(
+                "v2 metadata.continuous_behavior_status must be 'available'"
+            )
     replay_fingerprint = _required_sha256(
         metadata.get("replay_fingerprint"), name="metadata replay_fingerprint"
     )
@@ -734,6 +772,10 @@ def validate_replay_payload(
         row = row_metadata[step]
         if not isinstance(behavior, Mapping) or not isinstance(row, Mapping):
             raise Stage1TrajectoryReplayError("behavior and row_metadata rows must be objects")
+        if version == OUTPUT_VERSION and tuple(row) != ROW_METADATA_FIELDS:
+            raise Stage1TrajectoryReplayError(
+                f"row_metadata fields changed at step {step}"
+            )
         for name, value in (("behavior", behavior), ("row_metadata", row)):
             if (
                 value.get("case_id") != case_id
@@ -741,13 +783,24 @@ def validate_replay_payload(
                 or value.get("step") != step
             ):
                 raise Stage1TrajectoryReplayError(f"{name} identity mismatch at step {step}")
-        status = behavior.get("label_status")
+        try:
+            normalized_behavior = normalize_replay_behavior(
+                behavior,
+                replay_version=version,
+                scoring_protocol=projected_protocol,
+                source=f"behavior[{step}]",
+            )
+        except BehaviorContractError as exc:
+            raise Stage1TrajectoryReplayError(
+                f"Invalid v{version} behavior at step {step}: {exc}"
+            ) from exc
+        status = normalized_behavior.get("label_status")
         if status not in {"ok", "unknown", "missing"}:
             raise Stage1TrajectoryReplayError(f"invalid label_status at step {step}")
         decisions = (
-            behavior.get("refusal_label"),
-            behavior.get("compliance_label"),
-            behavior.get("jailbreak_success"),
+            normalized_behavior.get("refusal_label"),
+            normalized_behavior.get("compliance_label"),
+            normalized_behavior.get("jailbreak_success"),
         )
         if status == "ok":
             if any(not isinstance(value, bool) for value in decisions):
@@ -761,6 +814,10 @@ def validate_replay_payload(
         elif any(value is not None for value in decisions):
             raise Stage1TrajectoryReplayError(
                 f"non-ok behavior decisions must be null at step {step}"
+            )
+        if row.get("response_sha256") != normalized_behavior.get("response_sha256"):
+            raise Stage1TrajectoryReplayError(
+                f"row response SHA mismatch at step {step}"
             )
         if row.get("checkpoint_sha256") != digest:
             raise Stage1TrajectoryReplayError(
@@ -791,7 +848,7 @@ def _replay_case(
 ) -> Mapping[str, Any]:
     import torch
 
-    from experiments.collect_safety_states import _pool_forward_states
+    from experiments.collect_safety_states import pool_forward_states
 
     layer_rows: "OrderedDict[Any, list[Any]]" = OrderedDict()
     attack_losses: list[float] = []
@@ -804,7 +861,7 @@ def _replay_case(
         waveform, delta = _checkpoint_tensors(checkpoint.checkpoint_path, step=step)
         loss = _attack_loss(metadata, step=step)
         behavior, target_text, target_source = _normalized_behavior(spec, step)
-        pooled = _pool_forward_states(
+        pooled = pool_forward_states(
             model,
             waveform,
             target_text=target_text,
@@ -876,6 +933,8 @@ def _replay_case(
             "model_id": model_id,
             "model_fingerprint": model_fingerprint,
             "model_provenance": dict(model_provenance),
+            "behavior_contract": behavior_contract(spec.scoring_protocol),
+            "continuous_behavior_status": "available",
             "replay_fingerprint": replay_fingerprint,
             "pooling": pooling,
             "token_span": token_span,
@@ -1005,6 +1064,12 @@ def replay_stage1_trajectories(
         )
         for row in rows
     )
+    scoring_protocol = specs[0].scoring_protocol
+    if any(spec.scoring_protocol != scoring_protocol for spec in specs):
+        raise Stage1TrajectoryReplayError(
+            "All replay behavior sidecars must share one scoring protocol"
+        )
+    behavior_descriptor = behavior_contract(scoring_protocol)
     model_provenance = _model_provenance(model_name, model_id, dtype)
     resolved_model_id = str(model_provenance["model_id"])
     model_fingerprint = str(model_provenance["model_fingerprint"])
@@ -1019,6 +1084,7 @@ def replay_stage1_trajectories(
         "behavior_sidecars": [
             {"path": path, "sha256": digest} for path, digest in behavior_sources
         ],
+        "behavior_contract": behavior_descriptor,
         "model_provenance": model_provenance,
         "model_fingerprint": model_fingerprint,
         "device": device,
@@ -1118,6 +1184,8 @@ def replay_stage1_trajectories(
                 "replay_fingerprint": replay_fingerprint,
                 "model_fingerprint": model_fingerprint,
                 "model_provenance": model_provenance,
+                "behavior_contract": behavior_descriptor,
+                "continuous_behavior_status": "available",
                 "config": replay_config,
                 "source_manifest": {
                     "path": str(manifest_path),
@@ -1137,6 +1205,8 @@ def replay_stage1_trajectories(
         "replay_fingerprint": replay_fingerprint,
         "model_fingerprint": model_fingerprint,
         "model_provenance": model_provenance,
+        "behavior_contract": behavior_descriptor,
+        "continuous_behavior_status": "available",
         "config": replay_config,
         "source_manifest": {"path": str(manifest_path), "sha256": manifest_sha256},
         "behavior_sidecars": [
@@ -1264,6 +1334,7 @@ __all__ = [
     "INDEX_VERSION",
     "OUTPUT_FORMAT",
     "OUTPUT_VERSION",
+    "ROW_METADATA_FIELDS",
     "Stage1TrajectoryReplayError",
     "build_parser",
     "replay_stage1_trajectories",
