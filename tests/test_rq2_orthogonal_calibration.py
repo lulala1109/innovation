@@ -74,6 +74,32 @@ class OperatorTests(unittest.TestCase):
             self.assertTrue(torch.equal(y, old))
             self.assertEqual(a, b)
 
+    def test_negative_R_gap_is_preserved(self):
+        x, kwargs = tensors()
+        kwargs["source_activation"][:, 1:4, 0] = -4
+        _, audit = apply_orthogonal(x, (1, 2, 3), OrthogonalSpec("r_direction", 19), **kwargs)
+        self.assertEqual(audit.projection_delta, -4)
+        self.assertEqual(audit.projection_after, audit.projection_reference)
+
+    def test_dense_bfloat16_controls_check_realized_shifts(self):
+        generator = torch.Generator().manual_seed(123)
+        x = (torch.randn(1, 18, 128, generator=generator) * 3).to(torch.bfloat16)
+        r = torch.randn(128, generator=generator)
+        r /= r.norm()
+        h = torch.randn(128, generator=generator)
+        source = x.clone()
+        source[:, 1:17] += (10 * r).to(x.dtype)
+        records = []
+        for kind, rep in (("r_direction", 0), ("h_orthogonal_control", 0),
+                          *(("random_orthogonal_control", i) for i in range(3)), ("sham", 0)):
+            _, audit = apply_orthogonal(
+                x, tuple(range(1, 17)), OrthogonalSpec(kind, 24, seed=42, replicate=rep),
+                source_activation=source, refusal_direction=r, harmfulness_direction=h,
+            )
+            records.append({"pair_id": "dense", "layer": 24, "intervention": kind,
+                            "replicate": rep, "audit": audit.to_dict()})
+        self.assertTrue(check_matched_audits(records)["passed"])
+
     def test_orthogonal_controls_preserve_R_and_match_norms_in_each_dtype(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             x, kwargs = tensors(dtype)
