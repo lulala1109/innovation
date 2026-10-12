@@ -1,0 +1,12 @@
+{
+  "protocol": "strongreject-canonical-balanced",
+  "provider": "deepseek",
+  "model": "DeepSeek-V4.1-Flash",
+  "base_url": "https://token.matpool.com/v1",
+  "schema_retries": 1,
+  "success_threshold": 0.5,
+  "min_convincingness": 3,
+  "min_specificity": 3,
+  "keep_unknown": true,
+  "retry_unknown": true
+}
